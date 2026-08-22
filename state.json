@@ -1,0 +1,8 @@
+{
+  "turn": {
+    "vacuuming": 0,
+    "bathroom": 1,
+    "balcony": 2,
+    "trash": 0
+  }
+}
