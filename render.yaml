@@ -10,7 +10,7 @@ services:
         sync: false
       - key: TWILIO_AUTH_TOKEN
         sync: false
-      - key: TWILIO_WHATSAPP_NUMBER
+      - key: TWILIO_PHONE_NUMBER
         sync: false
       - key: PERSON_1_NAME
         sync: false

@@ -1,5 +1,5 @@
 // House Chore Bot
-// A WhatsApp bot (via Twilio) that reminds housemates whose turn it is
+// An SMS bot (via Twilio) that reminds housemates whose turn it is
 // to do a chore, and rotates turns round-robin as chores get marked done.
 
 require('dotenv').config();
@@ -20,8 +20,8 @@ const STATE_FILE = path.join(__dirname, 'state.json');
 // 1. Configure the 3 housemates and the 4 chores
 // ---------------------------------------------------------------------
 
-// Each person is identified by their WhatsApp number in E.164 format,
-// e.g. "whatsapp:+15551234567". Set these via environment variables.
+// Each person is identified by their phone number in E.164 format,
+// e.g. "+15551234567". Set these via environment variables.
 const PEOPLE = [
   { name: process.env.PERSON_1_NAME || 'Person 1', number: process.env.PERSON_1_NUMBER },
   { name: process.env.PERSON_2_NAME || 'Person 2', number: process.env.PERSON_2_NUMBER },
@@ -112,7 +112,7 @@ function isHelpRequest(text) {
 }
 
 function findPersonByNumber(number) {
-  // Twilio sends numbers like "whatsapp:+15551234567"
+  // Twilio sends numbers like "+15551234567"
   return PEOPLE.find((p) => p.number === number);
 }
 
@@ -143,15 +143,15 @@ const twilioClient =
     ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
     : null;
 
-const FROM_WHATSAPP_NUMBER = process.env.TWILIO_WHATSAPP_NUMBER; // e.g. "whatsapp:+14155238886"
+const FROM_NUMBER = process.env.TWILIO_PHONE_NUMBER; // e.g. "+15551230000" (a number you bought in Twilio)
 
-async function sendWhatsApp(toNumber, body) {
-  if (!twilioClient || !FROM_WHATSAPP_NUMBER) {
+async function sendSMS(toNumber, body) {
+  if (!twilioClient || !FROM_NUMBER) {
     console.warn('Twilio client not configured; would have sent:', toNumber, body);
     return;
   }
   await twilioClient.messages.create({
-    from: FROM_WHATSAPP_NUMBER,
+    from: FROM_NUMBER,
     to: toNumber,
     body,
   });
@@ -162,7 +162,7 @@ async function sendWhatsApp(toNumber, body) {
 // ---------------------------------------------------------------------
 
 app.post('/webhook', async (req, res) => {
-  const from = req.body.From; // "whatsapp:+1..."
+  const from = req.body.From; // "+1..."
   const body = (req.body.Body || '').trim();
 
   const { MessagingResponse } = twilio.twiml;
@@ -192,7 +192,7 @@ app.post('/webhook', async (req, res) => {
           `✅ Marked "${CHORES[choreId].label}" as done. Next up: ${next.name}.`
         );
         if (next.number !== from) {
-          await sendWhatsApp(
+          await sendSMS(
             next.number,
             `🏠 Heads up ${next.name} — it's your turn for: ${CHORES[choreId].label}.`
           );
@@ -204,7 +204,7 @@ app.post('/webhook', async (req, res) => {
           twiml.message(`No one is configured for that chore yet.`);
         } else {
           if (person.number !== from) {
-            await sendWhatsApp(
+            await sendSMS(
               person.number,
               `🏠 Reminder from ${senderName}: it's your turn to do — ${CHORES[choreId].label}.`
             );
