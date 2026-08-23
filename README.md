@@ -1,15 +1,20 @@
-# House Chore Bot (SMS)
+# House Chore Bot (SMS via Textbelt)
 
 A small bot for a 3-person household. Any of the 3 housemates can text it a chore
 name and it will remind whoever's turn it is via SMS. Turns rotate round-robin
 each time someone marks a chore "done".
+
+This version uses **Textbelt** instead of Twilio — no business/brand
+registration, no carrier approval wait. You get an API key and it works
+immediately.
 
 Chores tracked: **vacuuming**, **cleaning the bathroom**, **cleaning the balcony**,
 **taking out the trash**.
 
 ## How it works once it's live
 
-Text the bot's phone number:
+Text the bot's Textbelt-provided number (or shared number, depending on your
+plan):
 
 | You send | Bot does |
 |---|---|
@@ -20,47 +25,49 @@ Text the bot's phone number:
 
 No app to install for your housemates — it's a normal text message thread.
 
+### Important quirk: the one-time "seed" step
+
+Textbelt only routes someone's texts to your bot **after** you've sent them at
+least one message with a reply-webhook attached — it doesn't have a
+traditional "any message that arrives on this number, forward it to me"
+webhook the way Twilio does. Every message the bot sends re-arms this for the
+next reply, so once the loop is going it stays going — but there needs to be
+one initial nudge to kick it off for each person. That's what the `/seed`
+endpoint below is for. **Do this once after deploying, and again for anyone
+who hasn't texted the bot in a very long time** if they ever stop getting
+replies.
+
 ---
 
 ## Setup
 
-You'll do two things: (1) get a Twilio phone number for sending/receiving SMS,
-and (2) deploy this code somewhere it can run 24/7 (Render's free tier).
+### Step 1 — Get a Textbelt API key
 
-### Step 1 — Buy a Twilio phone number
+1. Go to https://textbelt.com/purchase/ and buy some SMS credits (no business
+   registration, no approval wait — pricing is shown per-region on that page).
+2. You'll get an API key. Save it.
+3. (Optional, free) You can test the whole flow first using the special test
+   key `textbelt_test` — it validates your setup without spending credit or
+   actually delivering a text, useful for confirming your deploy works before
+   spending real money.
 
-You already have a paid Twilio account, so this is quick and needs no approval wait:
+### Step 2 — Get everyone's phone numbers
 
-1. In the Twilio Console, go to **Phone Numbers → Buy a number** (or search "buy a number").
-2. Make sure **SMS** capability is checked as a filter, pick any number in your country
-   (US numbers are typically ~$1.15/month), and buy it.
-3. Note the number in E.164 format, e.g. `+15551230000`.
+Write down each housemate's number in E.164 format, e.g. `+15551234567`.
 
-### Step 2 — Get your Account SID and Auth Token
-
-From the Twilio Console home page (console.twilio.com), copy your **Account SID**
-and **Auth Token**. (If you already grabbed these earlier, they don't change when
-you buy a number.)
-
-### Step 3 — Get everyone's phone numbers
-
-Write down each housemate's number in E.164 format, e.g. `+15551234567` — no
-spaces, dashes, or `whatsapp:` prefix this time, since this is plain SMS.
-
-### Step 4 — Put this code on GitHub
+### Step 3 — Put this code on GitHub
 
 Render deploys from a Git repository.
 
 1. Create a free GitHub account if you don't have one: https://github.com/signup
 2. Create a new **private** repository (e.g. `house-chore-bot`).
-3. Upload the contents of this folder to that repository. Do **not** upload a
-   real `.env` file if you create one locally — only `.env.example` should go
-   in the repo.
+3. Upload the contents of this folder. Do **not** upload a real `.env` file —
+   only `.env.example` should go in the repo.
 
-### Step 5 — Deploy to Render (free tier)
+### Step 4 — Deploy to Render (free tier)
 
 1. Create a free account at https://render.com (you can sign up with GitHub).
-2. Click **New → Web Service** and connect the GitHub repo from Step 4.
+2. Click **New → Web Service** and connect your GitHub repo.
 3. Confirm:
    - **Build command:** `npm install`
    - **Start command:** `npm start`
@@ -69,9 +76,9 @@ Render deploys from a Git repository.
 
    | Key | Value |
    |---|---|
-   | `TWILIO_ACCOUNT_SID` | your Account SID |
-   | `TWILIO_AUTH_TOKEN` | your Auth Token |
-   | `TWILIO_PHONE_NUMBER` | the number you bought, e.g. `+15551230000` |
+   | `TEXTBELT_API_KEY` | your Textbelt API key (or `textbelt_test` for a dry run) |
+   | `WEBHOOK_BASE_URL` | your Render URL once deployed, e.g. `https://house-chore-bot.onrender.com` (no trailing slash) |
+   | `SEED_SECRET` | any password you make up, e.g. `mysecret123` |
    | `PERSON_1_NAME` | e.g. `Alex` |
    | `PERSON_1_NUMBER` | e.g. `+15551234567` |
    | `PERSON_2_NAME` | e.g. `Sam` |
@@ -79,22 +86,29 @@ Render deploys from a Git repository.
    | `PERSON_3_NAME` | e.g. `Jordan` |
    | `PERSON_3_NUMBER` | e.g. `+15551234569` |
 
-5. Click **Create Web Service**. Wait for the deploy to finish — you'll get a
-   URL like `https://house-chore-bot.onrender.com`.
+   Note: you won't know your exact Render URL until after the first deploy.
+   Deploy once, copy the URL Render gives you, then come back and set
+   `WEBHOOK_BASE_URL` to it (Render will redeploy automatically when you save
+   an env var change).
 
-### Step 6 — Point Twilio at your deployed bot
+5. Click **Create Web Service** and wait for it to go live.
 
-1. In the Twilio Console, go to **Phone Numbers → Manage → Active Numbers** and
-   click the number you bought.
-2. Scroll to the **Messaging Configuration** section.
-3. Set **"A message comes in"** to **Webhook**, and enter:
-   `https://house-chore-bot.onrender.com/webhook`, method `POST`.
-4. Save.
+### Step 5 — Run the one-time seed
 
-### Step 7 — Test it
+Once deployed with the real `WEBHOOK_BASE_URL` set, open this in a browser
+(replace with your actual URL and secret):
 
-From any of the 3 housemates' phones, text the bot's number something like
-`trash` or `status`. You should get a reply within a few seconds.
+```
+https://house-chore-bot.onrender.com/seed?secret=mysecret123
+```
+
+This texts all 3 housemates an intro message and arms their reply channels.
+You should see a JSON response confirming each send succeeded.
+
+### Step 6 — Test it
+
+From any of the 3 housemates' phones, reply to that intro text with something
+like `trash` or `status`. You should get a reply within a few seconds.
 
 ---
 
@@ -102,15 +116,19 @@ From any of the 3 housemates' phones, text the bot's number something like
 
 - **Free Render tier sleeps after inactivity.** The first message after a quiet
   period may take ~30–50 seconds to get a reply while the server wakes up.
-  Later messages are fast.
-- **State resets on redeploy.** Whose-turn-is-it is stored in `state.json` on
-  the server's disk. It survives normal restarts/sleep, but a fresh deploy
-  resets rotation back to the starting order. If this bothers you, ask and
-  a small free database (e.g. Render's free Postgres, or Upstash Redis) can
-  be added for true persistence.
-- **Cost:** roughly $1/month for the phone number, plus about $0.0079 per
-  SMS segment sent (US pricing) — for a household's worth of chore texts,
-  that's typically under $1–2/month total.
+- **State resets on redeploy.** Whose-turn-is-it, and who's been seeded, are
+  stored in `state.json` on disk. It survives normal restarts/sleep, but a
+  fresh deploy resets it. Ask if you want this moved to a small free database
+  for true persistence.
+- **The reply-channel behavior is Textbelt's own undocumented mechanic** —
+  their public docs don't fully specify how long a channel stays "armed" after
+  the last message. The bot re-arms it on every single message it sends (both
+  replies and reminders), which should keep it alive indefinitely through
+  normal use. If someone ever stops getting replies after a long silence, hit
+  `/seed` again to re-open their channel.
+- **Cost:** pay-per-text, no monthly fee — check https://textbelt.com/purchase/
+  for current rates. For a household's worth of chore texts, this should be a
+  small amount per month.
 - **Changing the chores or rotation logic:** edit the `CHORES` object and the
   keyword lists near the top of `server.js`.
 
@@ -118,14 +136,13 @@ From any of the 3 housemates' phones, text the bot's number something like
 
 ```bash
 npm install
-cp .env.example .env   # then fill in real values
+cp .env.example .env   # then fill in real values (or use TEXTBELT_API_KEY=textbelt_test)
 npm start
 ```
 
-Then simulate an incoming message without needing Twilio or a phone:
-
-```bash
-curl -X POST http://localhost:3000/webhook \
-  -d "From=+15551234567" \
-  -d "Body=status"
-```
+Then simulate an incoming reply without needing a real webhook call from
+Textbelt — note this only works if you disable signature verification
+temporarily, since Textbelt signs real webhook calls with your API key. The
+simplest way to test end-to-end is to actually deploy with `textbelt_test`
+and use the `/seed` endpoint, which exercises the real send path without
+spending money or delivering a real text.

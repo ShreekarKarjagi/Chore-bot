@@ -1,17 +1,25 @@
 // House Chore Bot
-// An SMS bot (via Twilio) that reminds housemates whose turn it is
-// to do a chore, and rotates turns round-robin as chores get marked done.
+// An SMS bot (via Textbelt — no business/carrier registration required) that
+// reminds housemates whose turn it is to do a chore, and rotates turns
+// round-robin as chores get marked done.
 
 require('dotenv').config();
 const express = require('express');
-const bodyParser = require('body-parser');
 const fs = require('fs');
 const path = require('path');
-const twilio = require('twilio');
+const crypto = require('crypto');
 
 const app = express();
-app.use(bodyParser.urlencoded({ extended: false }));
-app.use(bodyParser.json());
+
+// Capture the raw JSON body (needed to verify Textbelt's webhook signature,
+// which is computed over the exact raw bytes Textbelt sent).
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf.toString('utf8');
+    },
+  })
+);
 
 const PORT = process.env.PORT || 3000;
 const STATE_FILE = path.join(__dirname, 'state.json');
@@ -58,7 +66,7 @@ function loadState() {
       console.error('Failed to parse state.json, starting fresh:', e);
     }
   }
-  const fresh = { turn: {} };
+  const fresh = { turn: {}, seeded: [] };
   Object.keys(CHORES).forEach((choreId, i) => {
     // Stagger starting turns so nobody is dead last on everything by coincidence.
     fresh.turn[choreId] = i % Math.max(PEOPLE.length, 1);
@@ -71,6 +79,7 @@ function saveState(state) {
 }
 
 let state = loadState();
+if (!state.seeded) state.seeded = [];
 
 function whoseTurn(choreId) {
   const idx = state.turn[choreId] ?? 0;
@@ -111,9 +120,19 @@ function isHelpRequest(text) {
   return /\bhelp\b/i.test(text.toLowerCase());
 }
 
+// Normalize any phone number format down to a bare digit string so we can
+// reliably match numbers coming back from Textbelt against our configured
+// PEOPLE list, regardless of formatting differences (+1, spaces, etc).
+function normalizeNumber(num) {
+  if (!num) return '';
+  const digits = String(num).replace(/\D/g, '');
+  if (digits.length === 11 && digits[0] === '1') return digits.slice(1);
+  return digits;
+}
+
 function findPersonByNumber(number) {
-  // Twilio sends numbers like "+15551234567"
-  return PEOPLE.find((p) => p.number === number);
+  const target = normalizeNumber(number);
+  return PEOPLE.find((p) => normalizeNumber(p.number) === target);
 }
 
 function statusMessage() {
@@ -127,100 +146,186 @@ function statusMessage() {
 function helpMessage() {
   return (
     `🏠 House Chore Bot\n\n` +
-    `Message me a chore name (e.g. "trash", "vacuuming", "bathroom", "balcony") ` +
+    `Text me a chore name (e.g. "trash", "vacuuming", "bathroom", "balcony") ` +
     `and I'll remind whoever's turn it is.\n\n` +
-    `Say "<chore> done" (e.g. "trash done") when it's finished to pass the turn to the next person.\n\n` +
-    `Say "status" any time to see whose turn it is for everything.`
+    `Text "<chore> done" (e.g. "trash done") when it's finished to pass the turn to the next person.\n\n` +
+    `Text "status" any time to see whose turn it is for everything.`
   );
 }
 
 // ---------------------------------------------------------------------
-// 4. Twilio client for proactively messaging people
+// 4. Textbelt client for sending messages
 // ---------------------------------------------------------------------
 
-const twilioClient =
-  process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN
-    ? twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN)
-    : null;
+const TEXTBELT_API_KEY = process.env.TEXTBELT_API_KEY;
+// Your deployed base URL, e.g. "https://house-chore-bot.onrender.com" (no trailing slash).
+const WEBHOOK_BASE_URL = (process.env.WEBHOOK_BASE_URL || '').replace(/\/+$/, '');
 
-const FROM_NUMBER = process.env.TWILIO_PHONE_NUMBER; // e.g. "+15551230000" (a number you bought in Twilio)
+function toTextbeltPhone(num) {
+  const trimmed = String(num || '').trim();
+  const digits = trimmed.replace(/\D/g, '');
+  if (digits.length === 11 && digits[0] === '1') return digits.slice(1);
+  if (trimmed.startsWith('+') && !trimmed.startsWith('+1')) return trimmed; // international, keep E.164
+  return digits;
+}
 
-async function sendSMS(toNumber, body) {
-  if (!twilioClient || !FROM_NUMBER) {
-    console.warn('Twilio client not configured; would have sent:', toNumber, body);
+async function sendSMS(toNumber, message) {
+  if (!TEXTBELT_API_KEY) {
+    console.warn('TEXTBELT_API_KEY not configured; would have sent:', toNumber, message);
     return;
   }
-  await twilioClient.messages.create({
-    from: FROM_NUMBER,
-    to: toNumber,
-    body,
-  });
+  const params = new URLSearchParams();
+  params.set('phone', toTextbeltPhone(toNumber));
+  params.set('message', message);
+  params.set('key', TEXTBELT_API_KEY);
+  if (WEBHOOK_BASE_URL) {
+    // Re-arm the reply channel every time we message someone, so their next
+    // text back (whenever that is) keeps routing to our webhook.
+    params.set('replyWebhookUrl', `${WEBHOOK_BASE_URL}/webhook`);
+  }
+
+  console.log(`Sending SMS to ${toNumber}: ${message}`);
+  try {
+    const res = await fetch('https://textbelt.com/text', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: params.toString(),
+    });
+    const data = await res.json();
+    if (!data.success) {
+      console.error('Textbelt send failed:', data);
+    } else {
+      console.log('Textbelt send OK, quotaRemaining:', data.quotaRemaining);
+    }
+    return data;
+  } catch (err) {
+    // Network error, Textbelt outage, bad response body, etc. Never let a
+    // failed send crash the server — just log it and move on.
+    console.error('Textbelt request threw:', err.message);
+    return { success: false, error: err.message };
+  }
 }
 
 // ---------------------------------------------------------------------
-// 5. Webhook
+// 5. Webhook signature verification
+// ---------------------------------------------------------------------
+
+function verifyTextbeltSignature(req) {
+  if (!TEXTBELT_API_KEY) return false;
+  const signature = req.headers['x-textbelt-signature'];
+  const timestamp = req.headers['x-textbelt-timestamp'];
+  if (!signature || !timestamp || !req.rawBody) return false;
+
+  // Reject requests with a stale timestamp (older than 15 minutes).
+  const ageMs = Date.now() - Number(timestamp);
+  if (!Number.isFinite(ageMs) || Math.abs(ageMs) > 15 * 60 * 1000) return false;
+
+  const expected = crypto
+    .createHmac('sha256', TEXTBELT_API_KEY)
+    .update(timestamp + req.rawBody)
+    .digest('hex');
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  } catch (e) {
+    return false; // length mismatch etc.
+  }
+}
+
+// ---------------------------------------------------------------------
+// 6. Webhook — Textbelt POSTs here when someone replies
 // ---------------------------------------------------------------------
 
 app.post('/webhook', async (req, res) => {
-  const from = req.body.From; // "+1..."
-  const body = (req.body.Body || '').trim();
+  if (!verifyTextbeltSignature(req)) {
+    console.warn('Rejected webhook with invalid/missing signature');
+    return res.status(401).send('invalid signature');
+  }
 
-  const { MessagingResponse } = twilio.twiml;
-  const twiml = new MessagingResponse();
+  const { fromNumber, text } = req.body || {};
+  const body = (text || '').trim();
 
-  const sender = findPersonByNumber(from);
+  // Acknowledge Textbelt immediately; we send any reply as a separate outbound SMS.
+  res.status(200).send('ok');
+
+  const sender = findPersonByNumber(fromNumber);
   const senderName = sender ? sender.name : 'Someone';
+  const replyTo = fromNumber;
 
   try {
-    if (!body) {
-      twiml.message(helpMessage());
-    } else if (isHelpRequest(body)) {
-      twiml.message(helpMessage());
-    } else if (isStatusRequest(body)) {
-      twiml.message(statusMessage());
-    } else {
-      const choreId = findChoreInText(body);
+    if (!body || isHelpRequest(body)) {
+      await sendSMS(replyTo, helpMessage());
+      return;
+    }
+    if (isStatusRequest(body)) {
+      await sendSMS(replyTo, statusMessage());
+      return;
+    }
 
-      if (!choreId) {
-        twiml.message(
-          `I didn't recognize a chore in that message. ${helpMessage()}`
-        );
-      } else if (isDoneMessage(body)) {
-        const completedBy = whoseTurn(choreId);
-        const next = advanceTurn(choreId);
-        twiml.message(
-          `✅ Marked "${CHORES[choreId].label}" as done. Next up: ${next.name}.`
-        );
-        if (next.number !== from) {
-          await sendSMS(
-            next.number,
-            `🏠 Heads up ${next.name} — it's your turn for: ${CHORES[choreId].label}.`
-          );
-        }
-      } else {
-        // Reminder request
-        const person = whoseTurn(choreId);
-        if (!person) {
-          twiml.message(`No one is configured for that chore yet.`);
-        } else {
-          if (person.number !== from) {
-            await sendSMS(
-              person.number,
-              `🏠 Reminder from ${senderName}: it's your turn to do — ${CHORES[choreId].label}.`
-            );
-            twiml.message(`Got it — I reminded ${person.name} to handle "${CHORES[choreId].label}".`);
-          } else {
-            twiml.message(`Looks like it's already your turn for "${CHORES[choreId].label}" — go get 'em!`);
-          }
-        }
+    const choreId = findChoreInText(body);
+
+    if (!choreId) {
+      await sendSMS(replyTo, `I didn't recognize a chore in that message. ${helpMessage()}`);
+      return;
+    }
+
+    if (isDoneMessage(body)) {
+      const next = advanceTurn(choreId);
+      await sendSMS(replyTo, `✅ Marked "${CHORES[choreId].label}" as done. Next up: ${next.name}.`);
+      if (normalizeNumber(next.number) !== normalizeNumber(fromNumber)) {
+        await sendSMS(next.number, `🏠 Heads up ${next.name} — it's your turn for: ${CHORES[choreId].label}.`);
       }
+      return;
+    }
+
+    // Reminder request
+    const person = whoseTurn(choreId);
+    if (!person) {
+      await sendSMS(replyTo, `No one is configured for that chore yet.`);
+      return;
+    }
+    if (normalizeNumber(person.number) !== normalizeNumber(fromNumber)) {
+      await sendSMS(person.number, `🏠 Reminder from ${senderName}: it's your turn to do — ${CHORES[choreId].label}.`);
+      await sendSMS(replyTo, `Got it — I reminded ${person.name} to handle "${CHORES[choreId].label}".`);
+    } else {
+      await sendSMS(replyTo, `Looks like it's already your turn for "${CHORES[choreId].label}" — go get 'em!`);
     }
   } catch (err) {
     console.error('Error handling message:', err);
-    twiml.message('Sorry, something went wrong handling that. Please try again.');
+    await sendSMS(replyTo, 'Sorry, something went wrong handling that. Please try again.').catch(() => {});
   }
+});
 
-  res.type('text/xml').send(twiml.toString());
+// ---------------------------------------------------------------------
+// 7. One-time seed endpoint
+// ---------------------------------------------------------------------
+// Textbelt only routes future texts to your webhook once a reply channel has
+// been opened with that number. Hit this once after deploying (from a
+// browser, with your secret) to text all 3 people and arm their channels.
+
+app.get('/seed', async (req, res) => {
+  const secret = process.env.SEED_SECRET;
+  if (secret && req.query.secret !== secret) {
+    return res.status(403).send('forbidden');
+  }
+  try {
+    const results = [];
+    for (const person of PEOPLE) {
+      const r = await sendSMS(
+        person.number,
+        `👋 Hi ${person.name}, this is your house chore bot! Text me a chore name ("trash", "vacuuming", "bathroom", "balcony") anytime, or "status" to see whose turn it is.`
+      );
+      results.push({ person: person.name, success: r && r.success });
+      if (!state.seeded.includes(person.number)) {
+        state.seeded.push(person.number);
+      }
+    }
+    saveState(state);
+    res.json({ seeded: results });
+  } catch (err) {
+    console.error('Error in /seed:', err);
+    res.status(500).json({ error: 'Something went wrong seeding — check server logs.' });
+  }
 });
 
 // Health check for hosting platforms
@@ -231,4 +336,16 @@ app.get('/', (req, res) => {
 app.listen(PORT, () => {
   console.log(`House Chore Bot listening on port ${PORT}`);
   console.log('Configured people:', PEOPLE.map((p) => `${p.name} <${p.number}>`).join(', '));
+  if (!WEBHOOK_BASE_URL) {
+    console.warn('WEBHOOK_BASE_URL is not set — replies from Textbelt will not be able to reach this server.');
+  }
+});
+
+// Last-resort safety net: log unexpected errors instead of letting the
+// process crash and get stuck in a restart loop on the host.
+process.on('unhandledRejection', (err) => {
+  console.error('Unhandled rejection:', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
 });
