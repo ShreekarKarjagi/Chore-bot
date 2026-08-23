@@ -227,7 +227,9 @@ function verifyTextbeltSignature(req) {
   }
 
   // Reject requests with a stale timestamp (older than 15 minutes).
-  const ageMs = Date.now() - Number(timestamp);
+  // The header is a standard Unix timestamp in SECONDS (10 digits), not
+  // milliseconds — multiply by 1000 before comparing against Date.now().
+  const ageMs = Date.now() - Number(timestamp) * 1000;
   if (!Number.isFinite(ageMs) || Math.abs(ageMs) > 15 * 60 * 1000) {
     console.warn('[sig] timestamp check failed, ageMs =', ageMs, 'raw timestamp header =', timestamp);
     return false;
