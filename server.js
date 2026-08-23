@@ -161,6 +161,16 @@ const TEXTBELT_API_KEY = process.env.TEXTBELT_API_KEY;
 // Your deployed base URL, e.g. "https://house-chore-bot.onrender.com" (no trailing slash).
 const WEBHOOK_BASE_URL = (process.env.WEBHOOK_BASE_URL || '').replace(/\/+$/, '');
 
+// TEST_MODE: when enabled, every outbound message is redirected to
+// TEST_NUMBER instead of its real recipient, so testing/debugging only ever
+// spends credits on one number. The original intended recipient is noted in
+// the message itself so you can still tell what would have happened.
+const TEST_MODE = /^(1|true|yes)$/i.test(process.env.TEST_MODE || '');
+const TEST_NUMBER = process.env.TEST_NUMBER || process.env.PERSON_1_NUMBER;
+if (TEST_MODE) {
+  console.log(`TEST_MODE is ON — all outbound SMS will be redirected to ${TEST_NUMBER}`);
+}
+
 function toTextbeltPhone(num) {
   const trimmed = String(num || '').trim();
   const digits = trimmed.replace(/\D/g, '');
@@ -174,9 +184,17 @@ async function sendSMS(toNumber, message) {
     console.warn('TEXTBELT_API_KEY not configured; would have sent:', toNumber, message);
     return;
   }
+
+  let actualTo = toNumber;
+  let actualMessage = message;
+  if (TEST_MODE && normalizeNumber(toNumber) !== normalizeNumber(TEST_NUMBER)) {
+    actualTo = TEST_NUMBER;
+    actualMessage = `[TEST — would go to ${toNumber}] ${message}`;
+  }
+
   const params = new URLSearchParams();
-  params.set('phone', toTextbeltPhone(toNumber));
-  params.set('message', message);
+  params.set('phone', toTextbeltPhone(actualTo));
+  params.set('message', actualMessage);
   params.set('key', TEXTBELT_API_KEY);
   if (WEBHOOK_BASE_URL) {
     // Re-arm the reply channel every time we message someone, so their next
@@ -184,7 +202,7 @@ async function sendSMS(toNumber, message) {
     params.set('replyWebhookUrl', `${WEBHOOK_BASE_URL}/webhook`);
   }
 
-  console.log(`Sending SMS to ${toNumber}: ${message}`);
+  console.log(`Sending SMS to ${actualTo}: ${actualMessage}`);
   try {
     const res = await fetch('https://textbelt.com/text', {
       method: 'POST',
@@ -328,8 +346,15 @@ app.get('/seed', async (req, res) => {
     return res.status(403).send('forbidden');
   }
   try {
+    // In TEST_MODE, only seed the one test person — sendSMS() would redirect
+    // the other two anyway, but skipping them here avoids spending 3 credits
+    // to deliver 1 actual text.
+    const peopleToSeed = TEST_MODE
+      ? PEOPLE.filter((p) => normalizeNumber(p.number) === normalizeNumber(TEST_NUMBER))
+      : PEOPLE;
+
     const results = [];
-    for (const person of PEOPLE) {
+    for (const person of peopleToSeed) {
       const r = await sendSMS(
         person.number,
         `👋 Hi ${person.name}, this is your house chore bot! Text me a chore name ("trash", "vacuuming", "bathroom", "balcony") anytime, or "status" to see whose turn it is.`
@@ -340,7 +365,7 @@ app.get('/seed', async (req, res) => {
       }
     }
     saveState(state);
-    res.json({ seeded: results });
+    res.json({ seeded: results, testMode: TEST_MODE });
   } catch (err) {
     console.error('Error in /seed:', err);
     res.status(500).json({ error: 'Something went wrong seeding — check server logs.' });

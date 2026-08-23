@@ -12,6 +12,10 @@ services:
         sync: false
       - key: SEED_SECRET
         sync: false
+      - key: TEST_MODE
+        sync: false
+      - key: TEST_NUMBER
+        sync: false
       - key: PERSON_1_NAME
         sync: false
       - key: PERSON_1_NUMBER
