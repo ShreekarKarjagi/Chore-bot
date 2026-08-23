@@ -211,23 +211,40 @@ async function sendSMS(toNumber, message) {
 // ---------------------------------------------------------------------
 
 function verifyTextbeltSignature(req) {
-  if (!TEXTBELT_API_KEY) return false;
+  if (!TEXTBELT_API_KEY) {
+    console.warn('[sig] TEXTBELT_API_KEY is not set on this server — cannot verify anything.');
+    return false;
+  }
   const signature = req.headers['x-textbelt-signature'];
   const timestamp = req.headers['x-textbelt-timestamp'];
-  if (!signature || !timestamp || !req.rawBody) return false;
+  console.log('[sig] headers present?', { signature: !!signature, timestamp: !!timestamp, rawBody: !!req.rawBody });
+  console.log('[sig] rawBody:', req.rawBody);
+  console.log('[sig] TEXTBELT_API_KEY length/prefix:', TEXTBELT_API_KEY.length, JSON.stringify(TEXTBELT_API_KEY.slice(0, 4)));
+
+  if (!signature || !timestamp || !req.rawBody) {
+    console.warn('[sig] missing signature, timestamp, or rawBody');
+    return false;
+  }
 
   // Reject requests with a stale timestamp (older than 15 minutes).
   const ageMs = Date.now() - Number(timestamp);
-  if (!Number.isFinite(ageMs) || Math.abs(ageMs) > 15 * 60 * 1000) return false;
+  if (!Number.isFinite(ageMs) || Math.abs(ageMs) > 15 * 60 * 1000) {
+    console.warn('[sig] timestamp check failed, ageMs =', ageMs, 'raw timestamp header =', timestamp);
+    return false;
+  }
 
   const expected = crypto
     .createHmac('sha256', TEXTBELT_API_KEY)
     .update(timestamp + req.rawBody)
     .digest('hex');
 
+  console.log('[sig] received signature:', signature);
+  console.log('[sig] expected signature:', expected);
+
   try {
     return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
   } catch (e) {
+    console.warn('[sig] timingSafeEqual threw (likely length mismatch):', e.message, 'sigLen:', signature.length, 'expectedLen:', expected.length);
     return false; // length mismatch etc.
   }
 }
