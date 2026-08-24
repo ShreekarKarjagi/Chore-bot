@@ -25,6 +25,94 @@ plan):
 
 No app to install for your housemates — it's a normal text message thread.
 
+### Automatic weekly reminders
+
+Beyond the reactive commands above, the bot also proactively texts whoever's
+turn it is at hardcoded times each week — no one has to ask. This is
+configured in the `SCHEDULE` object near the top of `server.js`:
+
+```js
+const SCHEDULE = {
+  vacuuming: [{ day: 'sat', time: '10:00' }],
+  bathroom: [{ day: 'wed', time: '18:00' }],
+  balcony: [{ day: 'sun', time: '11:00' }],
+  trash: [
+    { day: 'mon', time: '08:00' },
+    { day: 'thu', time: '08:00' },
+  ],
+};
+```
+
+Edit the days/times to match your household (a chore can have more than one
+entry per week, like trash above). `day` is a 3-letter lowercase weekday
+(`sun`…`sat`), `time` is 24-hour `"HH:MM"`, both interpreted in the
+`TIMEZONE` env var (defaults to `America/Los_Angeles`).
+
+A few behaviors worth knowing:
+
+- If two of your chores are ever scheduled for the exact same day and time
+  **and** it happens to be the same person's turn for both, they get **one
+  combined text** ("...it's your turn for: Vacuuming and Cleaning the
+  balcony.") instead of two separate ones — this is what keeps the automatic
+  reminders cheap even if your schedule gets busy.
+- Each reminder only ever fires once per calendar occurrence — the bot
+  tracks what it's already sent (`state.lastAutoSent`) so a server restart
+  or a timing glitch can't cause a duplicate text for the same slot.
+- If a send fails (e.g. a temporary Textbelt outage), that slot is **not**
+  marked as sent, so a restart within the same minute would retry it —
+  but once the minute passes, that occurrence is simply missed rather than
+  retried, since the bot only checks for exact matches. It'll fire normally
+  again at the next scheduled occurrence.
+
+### Status dashboard
+
+Visiting your deployed URL in a browser (e.g. `https://house-chore-bot.onrender.com/`)
+no longer just shows a plain "it's running" message — it's a real dashboard:
+
+- **System health** — at a glance, whether the Textbelt API key is configured,
+  whether `WEBHOOK_BASE_URL` is set, how many of the 3 housemates are
+  configured, how many have been seeded (see below), whether the automatic
+  scheduler has confirmed a heartbeat recently, and whether `TEST_MODE` is on.
+  Each row has a 🟢/🔴 (or 🧪/⚪ for test mode) so a problem is visible without
+  reading logs.
+- **Chore status** — whose turn it currently is for each chore, its
+  hardcoded schedule, and the next time it'll auto-remind someone.
+- **Quick actions** — buttons to run `/seed`, manually trigger the scheduler
+  right now, or preview what the scheduler would do, without needing to build
+  URLs by hand. These are protected by your `SEED_SECRET`, which you type
+  into the box on the page (it isn't saved anywhere) — the page itself shows
+  no phone numbers or secrets, so it's safe to glance at even though it isn't
+  login-protected. Don't share the URL publicly.
+
+For scripts or monitoring, the same data is available as JSON at `/status.json`
+(no secret needed — it's read-only and has nothing sensitive in it).
+
+This page also doubles as the health check Render pings to know the service
+is alive — it always returns 200, and surfaces any underlying problem (like a
+missing API key) on the page itself rather than as a failed health check.
+
+**Testing the schedule without waiting for the real time or spending
+credits:**
+
+```
+https://your-app.onrender.com/debug/schedule?secret=YOUR_SEED_SECRET&at=2026-08-25T15:00:00Z
+```
+
+This is read-only — it tells you what *would* happen at that moment (in your
+configured timezone) without sending anything. Good for sanity-checking your
+`SCHEDULE` and `TIMEZONE` are set up the way you think.
+
+To actually fire it for real (e.g. to test the full send, or to manually
+re-send something you missed):
+
+```
+POST https://your-app.onrender.com/debug/trigger-schedule?secret=YOUR_SEED_SECRET&at=2026-08-25T15:00:00Z
+```
+
+(`?at=` is optional on both — omit it to check/trigger "right now".) This one
+**does** send real texts (respecting `TEST_MODE` like everything else), so
+use it deliberately.
+
 ### Important quirk: the one-time "seed" step
 
 Textbelt only routes someone's texts to your bot **after** you've sent them at
@@ -110,12 +198,26 @@ You should see a JSON response confirming each send succeeded.
 From any of the 3 housemates' phones, reply to that intro text with something
 like `trash` or `status`. You should get a reply within a few seconds.
 
+While you're testing, keep the dashboard open at your app's root URL (e.g.
+`https://house-chore-bot.onrender.com/`) — it's the fastest way to see
+whether everything's configured correctly and whose turn it currently is,
+without digging through Render's logs.
+
 ---
 
 ## Notes and limitations
 
 - **Free Render tier sleeps after inactivity.** The first message after a quiet
   period may take ~30–50 seconds to get a reply while the server wakes up.
+- **The scheduler only runs while the server is awake.** Free Render services
+  spin down after ~15 minutes with no incoming HTTP traffic — and since the
+  scheduler is just a timer running inside this same process, a scheduled
+  reminder can get missed if the server happened to be asleep at that exact
+  minute (no incoming text or request in the run-up to it). Texting the bot
+  anything a minute or two before a scheduled time keeps it awake for that
+  slot. If missed reminders become a real problem, the fix is either a paid
+  Render instance (no sleep) or an external pinger that hits the site every
+  10–15 minutes to keep it awake — ask if you want that set up.
 - **State resets on redeploy.** Whose-turn-is-it, and who's been seeded, are
   stored in `state.json` on disk. It survives normal restarts/sleep, but a
   fresh deploy resets it. Ask if you want this moved to a small free database
@@ -125,7 +227,8 @@ like `trash` or `status`. You should get a reply within a few seconds.
   the last message. The bot re-arms it on every single message it sends (both
   replies and reminders), which should keep it alive indefinitely through
   normal use. If someone ever stops getting replies after a long silence, hit
-  `/seed` again to re-open their channel.
+  `/seed` again to re-open their channel (the dashboard's "Run /seed" button
+  does this without needing to build the URL by hand).
 - **Cost:** pay-per-text, no monthly fee — check https://textbelt.com/purchase/
   for current rates. For a household's worth of chore texts, this should be a
   small amount per month.

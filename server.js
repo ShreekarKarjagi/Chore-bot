@@ -66,7 +66,7 @@ function loadState() {
       console.error('Failed to parse state.json, starting fresh:', e);
     }
   }
-  const fresh = { turn: {}, seeded: [] };
+  const fresh = { turn: {}, seeded: [], lastAutoSent: {} };
   Object.keys(CHORES).forEach((choreId, i) => {
     // Stagger starting turns so nobody is dead last on everything by coincidence.
     fresh.turn[choreId] = i % Math.max(PEOPLE.length, 1);
@@ -80,6 +80,7 @@ function saveState(state) {
 
 let state = loadState();
 if (!state.seeded) state.seeded = [];
+if (!state.lastAutoSent) state.lastAutoSent = {};
 
 function whoseTurn(choreId) {
   const idx = state.turn[choreId] ?? 0;
@@ -334,7 +335,210 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 7. One-time seed endpoint
+// 7. Scheduled reminders — hardcoded weekly times per chore
+// ---------------------------------------------------------------------
+// Edit SCHEDULE below to set which day(s) and time(s) each chore should
+// automatically remind whoever's turn it is, no incoming text required.
+//   day:  'sun' | 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat'
+//   time: 24-hour "HH:MM", interpreted in TIMEZONE below
+// A chore can have more than one entry per week (e.g. trash twice a week).
+// These are placeholder defaults — edit them to match your household.
+
+const TIMEZONE = process.env.TIMEZONE || 'America/Los_Angeles';
+
+const SCHEDULE = {
+  vacuuming: [{ day: 'sat', time: '10:00' }],
+  bathroom: [{ day: 'wed', time: '18:00' }],
+  balcony: [{ day: 'sun', time: '11:00' }],
+  trash: [
+    { day: 'mon', time: '08:00' },
+    { day: 'thu', time: '08:00' },
+  ],
+};
+
+// Precompute {hour, minute} once at startup instead of re-parsing the
+// "HH:MM" string on every check.
+function parseHHMM(str) {
+  const [hour, minute] = String(str).split(':').map((n) => parseInt(n, 10));
+  return { hour, minute };
+}
+const SCHEDULE_PARSED = {};
+for (const [choreId, entries] of Object.entries(SCHEDULE)) {
+  SCHEDULE_PARSED[choreId] = entries.map((e) => ({ day: e.day, ...parseHHMM(e.time) }));
+}
+
+// Get the current local weekday/hour/minute/date in TIMEZONE. Uses the
+// platform's ICU timezone database (via Intl) rather than manual UTC offset
+// math, so daylight saving transitions are handled automatically instead of
+// silently going an hour off twice a year.
+function getLocalParts(date, timeZone) {
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone,
+    weekday: 'short',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+  const parts = {};
+  for (const p of fmt.formatToParts(date)) parts[p.type] = p.value;
+  let hour = parseInt(parts.hour, 10);
+  if (hour === 24) hour = 0; // some locales render midnight as "24" instead of "00"
+  return {
+    weekday: parts.weekday.toLowerCase().slice(0, 3), // 'sun', 'mon', ...
+    hour,
+    minute: parseInt(parts.minute, 10),
+    dateStr: `${parts.year}-${parts.month}-${parts.day}`,
+  };
+}
+
+// Figure out which reminders are due right now, grouped by PERSON so anyone
+// with 2+ chores due in the same minute gets ONE combined text instead of
+// several — this is the main way the scheduler keeps API usage efficient.
+// Pure function of (now, state) so it can be tested with a fixed date
+// instead of waiting on the real clock.
+function findDueReminders(now) {
+  const { weekday, hour, minute, dateStr } = getLocalParts(now, TIMEZONE);
+  const duePerPerson = new Map(); // number -> { name, chores: [...], slotKeys: [{slotKey, dateStr}] }
+
+  for (const [choreId, entries] of Object.entries(SCHEDULE_PARSED)) {
+    for (const entry of entries) {
+      if (entry.day !== weekday || entry.hour !== hour || entry.minute !== minute) continue;
+
+      const slotKey = `${choreId}|${entry.day}|${String(entry.hour).padStart(2, '0')}:${String(entry.minute).padStart(2, '0')}`;
+      // Already sent for this exact calendar occurrence? Skip — prevents a
+      // duplicate send if the ticker fires more than once inside the same
+      // minute, or the server restarts right at the boundary.
+      if (state.lastAutoSent[slotKey] === dateStr) continue;
+
+      const person = whoseTurn(choreId);
+      if (!person) continue;
+
+      if (!duePerPerson.has(person.number)) {
+        duePerPerson.set(person.number, { name: person.name, chores: [], slotKeys: [] });
+      }
+      const forPerson = duePerPerson.get(person.number);
+      forPerson.chores.push(CHORES[choreId].label);
+      forPerson.slotKeys.push({ slotKey, dateStr });
+    }
+  }
+
+  return duePerPerson;
+}
+
+function joinWithAnd(items) {
+  if (items.length === 1) return items[0];
+  return items.slice(0, -1).join(', ') + ' and ' + items[items.length - 1];
+}
+
+async function runScheduledReminders(now = new Date()) {
+  try {
+    const due = findDueReminders(now);
+    if (due.size === 0) return;
+
+    for (const [number, info] of due.entries()) {
+      const message = `🏠 Reminder ${info.name} — today it's your turn for: ${joinWithAnd(info.chores)}.`;
+      const result = await sendSMS(number, message);
+
+      // Only mark these slots as sent if the send actually succeeded.
+      // Marking on failure would permanently suppress that reminder for the
+      // week with no way to recover; leaving it unmarked means a restart
+      // that re-ticks the same minute will retry it.
+      if (result && result.success) {
+        for (const { slotKey, dateStr } of info.slotKeys) {
+          state.lastAutoSent[slotKey] = dateStr;
+        }
+      } else {
+        console.error(`Scheduled reminder to ${info.name} failed to send — not marked, will not retry until next scheduled slot.`);
+      }
+    }
+
+    saveState(state);
+  } catch (err) {
+    // A bug here should never take down the whole server — just skip this
+    // tick and try again next minute.
+    console.error('Error running scheduled reminders:', err);
+  }
+}
+
+// Tracks when the scheduler last actually ran, so the status dashboard can
+// show real evidence it's alive rather than just assuming so.
+let lastTickAt = null;
+
+// Compute the next future occurrence of a single schedule entry, for display
+// purposes only (not used by the actual due-check, which only cares about
+// exact-minute matches). Brute-forces forward minute by minute for up to a
+// week — simple and obviously correct rather than clever, since a subtle bug
+// here would only affect a status display, not any real behavior.
+function computeNextOccurrence(entry, from, timeZone) {
+  const start = new Date(Math.ceil(from.getTime() / 60000) * 60000); // round up to next minute
+  for (let i = 0; i <= 7 * 24 * 60; i++) {
+    const candidate = new Date(start.getTime() + i * 60000);
+    const { weekday, hour, minute } = getLocalParts(candidate, timeZone);
+    if (weekday === entry.day && hour === entry.hour && minute === entry.minute) {
+      return candidate;
+    }
+  }
+  return null; // should be unreachable given a valid entry
+}
+
+// Check once a minute. runScheduledReminders() already catches its own
+// errors; this wrapper is an extra safety net on top of that.
+const SCHEDULER_INTERVAL_MS = 60 * 1000;
+setInterval(() => {
+  lastTickAt = new Date();
+  runScheduledReminders(lastTickAt).catch((err) => console.error('Unexpected scheduler error:', err));
+}, SCHEDULER_INTERVAL_MS);
+
+// Read-only debug endpoint: check what the scheduler would do at a given
+// moment, without sending anything or changing state. Useful for confirming
+// your SCHEDULE and TIMEZONE are set up the way you expect.
+// e.g. /debug/schedule?secret=...&at=2026-08-25T15:00:00Z
+app.get('/debug/schedule', (req, res) => {
+  const secret = process.env.SEED_SECRET;
+  if (secret && req.query.secret !== secret) {
+    return res.status(403).send('forbidden');
+  }
+  const at = req.query.at ? new Date(req.query.at) : new Date();
+  if (Number.isNaN(at.getTime())) {
+    return res.status(400).json({ error: 'invalid ?at= timestamp — use ISO format, e.g. 2026-08-25T15:00:00Z' });
+  }
+  const due = findDueReminders(at);
+  res.json({
+    now: at.toISOString(),
+    timezone: TIMEZONE,
+    local: getLocalParts(at, TIMEZONE),
+    due: Array.from(due.entries()).map(([number, info]) => ({ number, name: info.name, chores: info.chores })),
+  });
+});
+
+// Manually fire the scheduler right now (or for a simulated time via ?at=).
+// Unlike /debug/schedule, this ACTUALLY sends messages and updates state —
+// useful for testing the real send-and-mark path without waiting for the
+// clock to hit an exact scheduled minute, or for manually re-sending a
+// reminder you missed. Respects TEST_MODE like everything else.
+app.post('/debug/trigger-schedule', async (req, res) => {
+  const secret = process.env.SEED_SECRET;
+  if (secret && req.query.secret !== secret) {
+    return res.status(403).send('forbidden');
+  }
+  const at = req.query.at ? new Date(req.query.at) : new Date();
+  if (Number.isNaN(at.getTime())) {
+    return res.status(400).json({ error: 'invalid ?at= timestamp — use ISO format, e.g. 2026-08-25T15:00:00Z' });
+  }
+  try {
+    await runScheduledReminders(at);
+    res.json({ ranAt: at.toISOString(), lastAutoSent: state.lastAutoSent });
+  } catch (err) {
+    console.error('Error in /debug/trigger-schedule:', err);
+    res.status(500).json({ error: 'Something went wrong — check server logs.' });
+  }
+});
+
+// ---------------------------------------------------------------------
+// 8. One-time seed endpoint
 // ---------------------------------------------------------------------
 // Textbelt only routes future texts to your webhook once a reply channel has
 // been opened with that number. Hit this once after deploying (from a
@@ -372,9 +576,176 @@ app.get('/seed', async (req, res) => {
   }
 });
 
-// Health check for hosting platforms
+// ---------------------------------------------------------------------
+// 9. Status dashboard
+// ---------------------------------------------------------------------
+// A single data function feeds both the HTML dashboard and the JSON
+// endpoint, so the two views can't drift out of sync with each other.
+// Deliberately excludes phone numbers and secrets — this page has no auth
+// (it also serves as Render's health check target), so nothing sensitive
+// belongs on it. Actions that actually send messages stay behind the
+// existing SEED_SECRET-protected endpoints.
+
+function buildStatusData() {
+  const now = new Date();
+  const local = getLocalParts(now, TIMEZONE);
+
+  const schedulerActive = lastTickAt !== null && Date.now() - lastTickAt.getTime() < SCHEDULER_INTERVAL_MS * 1.5;
+
+  const chores = Object.entries(CHORES).map(([choreId, chore]) => {
+    const person = whoseTurn(choreId);
+    const entries = SCHEDULE[choreId] || [];
+    const parsedEntries = SCHEDULE_PARSED[choreId] || [];
+    const nextDates = parsedEntries
+      .map((e) => computeNextOccurrence(e, now, TIMEZONE))
+      .filter(Boolean)
+      .sort((a, b) => a - b);
+    const next = nextDates[0] || null;
+
+    return {
+      id: choreId,
+      label: chore.label,
+      currentTurn: person ? person.name : 'unassigned',
+      scheduleText: entries.map((e) => `${e.day} ${e.time}`).join(', ') || 'not scheduled',
+      nextReminder: next
+        ? next.toLocaleString('en-US', { timeZone: TIMEZONE, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+        : null,
+    };
+  });
+
+  return {
+    serverTimeISO: now.toISOString(),
+    timezone: TIMEZONE,
+    localTimeText: `${local.weekday} ${String(local.hour).padStart(2, '0')}:${String(local.minute).padStart(2, '0')}`,
+    testMode: TEST_MODE,
+    textbeltConfigured: !!TEXTBELT_API_KEY,
+    webhookBaseUrlConfigured: !!WEBHOOK_BASE_URL,
+    webhookBaseUrl: WEBHOOK_BASE_URL || null,
+    peopleConfiguredCount: PEOPLE.length,
+    peopleNames: PEOPLE.map((p) => p.name),
+    seededCount: state.seeded.length,
+    schedulerActive,
+    schedulerLastTickISO: lastTickAt ? lastTickAt.toISOString() : null,
+    chores,
+  };
+}
+
+function escapeHTML(str) {
+  return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function renderDashboardHTML(data) {
+  const statusDot = (ok) => (ok ? '🟢' : '🔴');
+
+  const configRows = [
+    [statusDot(data.textbeltConfigured), 'Textbelt API key', data.textbeltConfigured ? 'configured' : 'MISSING — sends will fail'],
+    [statusDot(data.webhookBaseUrlConfigured), 'Webhook base URL', data.webhookBaseUrlConfigured ? escapeHTML(data.webhookBaseUrl) : 'MISSING — replies can\'t reach this server'],
+    [statusDot(data.peopleConfiguredCount === 3), 'Housemates configured', `${data.peopleConfiguredCount} / 3 (${escapeHTML(data.peopleNames.join(', ') || 'none')})`],
+    [statusDot(data.seededCount > 0), 'Reply channels seeded', `${data.seededCount} / ${data.peopleConfiguredCount}${data.seededCount === 0 ? ' — run /seed' : ''}`],
+    [statusDot(data.schedulerActive), 'Automatic reminders', data.schedulerActive ? `active — last checked ${escapeHTML(data.schedulerLastTickISO)}` : 'not confirmed active yet (server just started, or something is wrong — wait a minute and refresh)'],
+    [data.testMode ? '🧪' : '⚪', 'Test mode', data.testMode ? 'ON — all sends redirected to TEST_NUMBER' : 'off — sends go to real recipients'],
+  ];
+
+  const choreRows = data.chores
+    .map(
+      (c) => `
+      <tr>
+        <td>${escapeHTML(c.label)}</td>
+        <td><strong>${escapeHTML(c.currentTurn)}</strong></td>
+        <td>${escapeHTML(c.scheduleText)}</td>
+        <td>${c.nextReminder ? escapeHTML(c.nextReminder) : '—'}</td>
+      </tr>`
+    )
+    .join('');
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>House Chore Bot — Status</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+  .subtitle { color: #777; margin-top: 0; margin-bottom: 1.5rem; font-size: 0.9rem; }
+  table { width: 100%; border-collapse: collapse; margin-bottom: 1.5rem; }
+  th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid rgba(128,128,128,0.25); font-size: 0.92rem; }
+  th { font-weight: 600; color: #888; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }
+  section { margin-bottom: 2rem; }
+  h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: 0.03em; color: #888; margin-bottom: 0.5rem; }
+  .actions { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+  input[type="password"] { padding: 0.5rem; border-radius: 6px; border: 1px solid rgba(128,128,128,0.4); font-size: 0.9rem; }
+  button { padding: 0.5rem 0.9rem; border-radius: 6px; border: 1px solid rgba(128,128,128,0.4); background: rgba(128,128,128,0.08); cursor: pointer; font-size: 0.9rem; }
+  button:hover { background: rgba(128,128,128,0.18); }
+  #actionResult { margin-top: 0.75rem; font-size: 0.85rem; white-space: pre-wrap; font-family: ui-monospace, monospace; background: rgba(128,128,128,0.08); padding: 0.6rem; border-radius: 6px; display: none; }
+  footer { color: #999; font-size: 0.8rem; margin-top: 2rem; }
+</style>
+</head>
+<body>
+  <h1>🏠 House Chore Bot</h1>
+  <p class="subtitle">Local time: ${escapeHTML(data.localTimeText)} (${escapeHTML(data.timezone)}) · Server time: ${escapeHTML(data.serverTimeISO)}</p>
+
+  <section>
+    <h2>System health</h2>
+    <table>
+      ${configRows.map(([dot, label, value]) => `<tr><td style="width:1.6rem">${dot}</td><td>${escapeHTML(label)}</td><td>${value}</td></tr>`).join('')}
+    </table>
+  </section>
+
+  <section>
+    <h2>Chore status</h2>
+    <table>
+      <tr><th>Chore</th><th>Whose turn</th><th>Schedule</th><th>Next auto-reminder</th></tr>
+      ${choreRows}
+    </table>
+  </section>
+
+  <section>
+    <h2>Quick actions</h2>
+    <p style="font-size:0.85rem; color:#888;">These send real messages (or nothing, in TEST_MODE). Enter your SEED_SECRET to use them.</p>
+    <div class="actions">
+      <input type="password" id="secretInput" placeholder="secret">
+      <button onclick="runAction('/seed', 'GET')">Run /seed</button>
+      <button onclick="runAction('/debug/trigger-schedule', 'POST')">Trigger scheduler now</button>
+      <button onclick="runAction('/debug/schedule', 'GET')">Preview schedule (read-only)</button>
+    </div>
+    <pre id="actionResult"></pre>
+  </section>
+
+  <footer>This page has no login — don't share this URL publicly. It intentionally shows no phone numbers.</footer>
+
+  <script>
+    async function runAction(path, method) {
+      const secret = document.getElementById('secretInput').value;
+      const resultEl = document.getElementById('actionResult');
+      resultEl.style.display = 'block';
+      resultEl.textContent = 'Working...';
+      try {
+        const res = await fetch(path + '?secret=' + encodeURIComponent(secret), { method });
+        const text = await res.text();
+        let pretty = text;
+        try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch (e) {}
+        resultEl.textContent = res.status + ' ' + res.statusText + '\\n' + pretty;
+      } catch (err) {
+        resultEl.textContent = 'Request failed: ' + err.message;
+      }
+    }
+  </script>
+</body>
+</html>`;
+}
+
+app.get('/status.json', (req, res) => {
+  res.json(buildStatusData());
+});
+
+// Root: the status dashboard. Also serves as the health check target for
+// Render (or any other host) — it returns 200 regardless of bot health, so
+// the underlying issues (config, scheduler) are surfaced ON the page rather
+// than as a failed health check.
 app.get('/', (req, res) => {
-  res.send('House Chore Bot is running.');
+  res.type('html').send(renderDashboardHTML(buildStatusData()));
 });
 
 app.listen(PORT, () => {

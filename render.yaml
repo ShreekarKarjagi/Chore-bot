@@ -12,6 +12,8 @@ services:
         sync: false
       - key: SEED_SECRET
         sync: false
+      - key: TIMEZONE
+        sync: false
       - key: TEST_MODE
         sync: false
       - key: TEST_NUMBER
