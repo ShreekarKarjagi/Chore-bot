@@ -6,5 +6,15 @@
     "trash": 0
   },
   "seeded": [],
-  "lastAutoSent": {}
+  "lastAutoSent": {},
+  "schedule": {
+    "vacuuming": [{ "day": "sat", "time": "10:00" }],
+    "bathroom": [{ "day": "wed", "time": "18:00" }],
+    "balcony": [{ "day": "sun", "time": "11:00" }],
+    "trash": [
+      { "day": "mon", "time": "08:00" },
+      { "day": "thu", "time": "08:00" }
+    ]
+  },
+  "customChores": {}
 }

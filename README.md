@@ -28,11 +28,14 @@ No app to install for your housemates — it's a normal text message thread.
 ### Automatic weekly reminders
 
 Beyond the reactive commands above, the bot also proactively texts whoever's
-turn it is at hardcoded times each week — no one has to ask. This is
-configured in the `SCHEDULE` object near the top of `server.js`:
+turn it is at scheduled times each week — no one has to ask. The schedule
+starts from a set of sensible defaults and lives in `state.json` from then
+on, so it's edited **from the dashboard**, not by changing code:
 
 ```js
-const SCHEDULE = {
+// server.js — DEFAULT_SCHEDULE only seeds state.schedule the very first
+// time the bot ever runs. After that, edit it from the dashboard.
+const DEFAULT_SCHEDULE = {
   vacuuming: [{ day: 'sat', time: '10:00' }],
   bathroom: [{ day: 'wed', time: '18:00' }],
   balcony: [{ day: 'sun', time: '11:00' }],
@@ -43,10 +46,9 @@ const SCHEDULE = {
 };
 ```
 
-Edit the days/times to match your household (a chore can have more than one
-entry per week, like trash above). `day` is a 3-letter lowercase weekday
-(`sun`…`sat`), `time` is 24-hour `"HH:MM"`, both interpreted in the
-`TIMEZONE` env var (defaults to `America/Los_Angeles`).
+`day` is a 3-letter lowercase weekday (`sun`…`sat`), `time` is 24-hour
+`"HH:MM"`, both interpreted in the `TIMEZONE` env var (defaults to
+`America/Los_Angeles`).
 
 A few behaviors worth knowing:
 
@@ -67,22 +69,39 @@ A few behaviors worth knowing:
 ### Status dashboard
 
 Visiting your deployed URL in a browser (e.g. `https://house-chore-bot.onrender.com/`)
-no longer just shows a plain "it's running" message — it's a real dashboard:
+shows a real dashboard, not just a plain "it's running" message:
 
 - **System health** — at a glance, whether the Textbelt API key is configured,
   whether `WEBHOOK_BASE_URL` is set, how many of the 3 housemates are
   configured, how many have been seeded (see below), whether the automatic
   scheduler has confirmed a heartbeat recently, and whether `TEST_MODE` is on.
-  Each row has a 🟢/🔴 (or 🧪/⚪ for test mode) so a problem is visible without
+  Each card has a 🟢/🔴 (or 🧪/⚪ for test mode) so a problem is visible without
   reading logs.
-- **Chore status** — whose turn it currently is for each chore, its
-  hardcoded schedule, and the next time it'll auto-remind someone.
+- **Tasks & schedule** — a card per task showing whose turn it is, every
+  scheduled day/time as a small pill, and the next time it'll auto-remind
+  someone. This is also the schedule *editor*:
+  - **Add a reminder** — pick an existing task (or type a new one) plus a
+    day and time, and hit "Add reminder." A brand-new task also gets its own
+    keywords (comma-separated words that trigger it over text, e.g.
+    `dishes, plates`) — defaulting to the task name if you leave that blank.
+    New tasks work exactly like the 4 built-in ones: reactive texting,
+    "done" rotation, and automatic reminders all just work.
+  - **Remove a reminder** — click the ✕ on any pill to drop that one
+    day/time slot.
+  - **Delete a task** — tasks you've added from the dashboard can be deleted
+    entirely (schedule + turn history); the 4 built-in chores can only be
+    unscheduled, not deleted, since they're wired into the code.
+  - **Add to Google Calendar** — click the 📅 on any pill to open a
+    pre-filled Google Calendar event (with a weekly recurrence already set)
+    on Google's own site — you just click "Save" there. This needs no
+    Google account or API key on the bot's side; it's a plain link Google
+    Calendar itself supports, so the bot can never create a calendar event
+    without that person's own click.
+  - Adding/removing/deleting all require your `SEED_SECRET` in the "Admin
+    key" box at the top of the page (typed in, never saved anywhere).
 - **Quick actions** — buttons to run `/seed`, manually trigger the scheduler
   right now, or preview what the scheduler would do, without needing to build
-  URLs by hand. These are protected by your `SEED_SECRET`, which you type
-  into the box on the page (it isn't saved anywhere) — the page itself shows
-  no phone numbers or secrets, so it's safe to glance at even though it isn't
-  login-protected. Don't share the URL publicly.
+  URLs by hand. Same admin key as above.
 
 For scripts or monitoring, the same data is available as JSON at `/status.json`
 (no secret needed — it's read-only and has nothing sensitive in it).
@@ -100,7 +119,7 @@ https://your-app.onrender.com/debug/schedule?secret=YOUR_SEED_SECRET&at=2026-08-
 
 This is read-only — it tells you what *would* happen at that moment (in your
 configured timezone) without sending anything. Good for sanity-checking your
-`SCHEDULE` and `TIMEZONE` are set up the way you think.
+schedule and `TIMEZONE` are set up the way you think.
 
 To actually fire it for real (e.g. to test the full send, or to manually
 re-send something you missed):
@@ -218,10 +237,21 @@ without digging through Render's logs.
   slot. If missed reminders become a real problem, the fix is either a paid
   Render instance (no sleep) or an external pinger that hits the site every
   10–15 minutes to keep it awake — ask if you want that set up.
-- **State resets on redeploy.** Whose-turn-is-it, and who's been seeded, are
-  stored in `state.json` on disk. It survives normal restarts/sleep, but a
-  fresh deploy resets it. Ask if you want this moved to a small free database
-  for true persistence.
+- **State resets on redeploy — this now includes schedule edits and
+  dashboard-added tasks, so read this one.** Whose-turn-is-it, who's been
+  seeded, the live schedule, and any tasks you've added from the dashboard
+  are all stored in `state.json` on disk. That file survives normal
+  restarts/sleep, but Render's free tier has no persistent disk, so a fresh
+  deploy (i.e. every `git push`) replaces it with whatever `state.json`
+  happens to be committed in your repo — **any schedule changes or tasks you
+  added from the dashboard since your last commit will be lost** on the next
+  deploy. If you've made changes on the live dashboard you want to keep:
+  copy the live `/status.json` (or the file itself, if you can reach the
+  Render disk) back into your repo's `state.json` and commit it before your
+  next deploy. Day-to-day code changes that don't touch the schedule won't
+  disturb anything as long as you're not deploying in the same window as a
+  dashboard edit. Ask if you'd like this moved to a small free database
+  (removes this gotcha entirely).
 - **The reply-channel behavior is Textbelt's own undocumented mechanic** —
   their public docs don't fully specify how long a channel stays "armed" after
   the last message. The bot re-arms it on every single message it sends (both
@@ -232,8 +262,13 @@ without digging through Render's logs.
 - **Cost:** pay-per-text, no monthly fee — check https://textbelt.com/purchase/
   for current rates. For a household's worth of chore texts, this should be a
   small amount per month.
-- **Changing the chores or rotation logic:** edit the `CHORES` object and the
-  keyword lists near the top of `server.js`.
+- **Changing tasks or the schedule:** day-to-day, use the dashboard (see
+  above) — no code or redeploy needed. The 4 built-in chores and their
+  keyword lists live in the `CHORES` object near the top of `server.js` if
+  you ever want to change those specifically (e.g. rename a chore, add more
+  trigger words); `DEFAULT_SCHEDULE` next to it is only the starting
+  schedule for a brand-new deploy, not the live one (see the state-reset
+  note above).
 
 ## Local testing (optional)
 

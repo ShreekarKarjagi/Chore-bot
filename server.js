@@ -25,7 +25,7 @@ const PORT = process.env.PORT || 3000;
 const STATE_FILE = path.join(__dirname, 'state.json');
 
 // ---------------------------------------------------------------------
-// 1. Configure the 3 housemates and the 4 chores
+// 1. Configure the 3 housemates and the 4 built-in chores
 // ---------------------------------------------------------------------
 
 // Each person is identified by their phone number in E.164 format,
@@ -45,6 +45,9 @@ if (PEOPLE.length !== 3) {
 
 // Chore definitions: id -> { label, keywords[] }
 // The bot matches an incoming message against these keywords (case-insensitive substring match).
+// These 4 are permanent (built into the code). Housemates can add MORE tasks
+// from the dashboard at runtime — those live in state.customChores (see
+// section 2) and behave identically once added.
 const CHORES = {
   vacuuming: { label: 'Vacuuming', keywords: ['vacuum', 'vacuuming', 'hoover'] },
   bathroom: { label: 'Cleaning the bathroom', keywords: ['bathroom', 'toilet'] },
@@ -52,11 +55,32 @@ const CHORES = {
   trash: { label: 'Taking out the trash', keywords: ['trash', 'garbage', 'rubbish', 'bins', 'bin'] },
 };
 
+// Valid schedule days, and the "HH:MM" 24-hour format shared by every
+// scheduling entry point (dashboard form, /api endpoints, DEFAULT_SCHEDULE).
+const DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+const TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+// Starter weekly schedule — only used to seed state.schedule the very first
+// time the bot ever runs (i.e. when state.json doesn't exist yet). After
+// that, state.schedule is the live, editable truth — edit it from the
+// dashboard, no code changes or redeploys required.
+const DEFAULT_SCHEDULE = {
+  vacuuming: [{ day: 'sat', time: '10:00' }],
+  bathroom: [{ day: 'wed', time: '18:00' }],
+  balcony: [{ day: 'sun', time: '11:00' }],
+  trash: [
+    { day: 'mon', time: '08:00' },
+    { day: 'thu', time: '08:00' },
+  ],
+};
+
 // ---------------------------------------------------------------------
-// 2. Persisted rotation state
+// 2. Persisted state — rotation, schedule, and dashboard-added chores
 // ---------------------------------------------------------------------
 // state.turn[choreId] = index into PEOPLE array = whose turn it currently is.
 // Rotation order is the same for every chore: PEOPLE[0] -> PEOPLE[1] -> PEOPLE[2] -> repeat.
+// state.schedule[choreId] = [{ day, time }, ...] — the live weekly schedule.
+// state.customChores[choreId] = { label, keywords } — tasks added from the dashboard.
 
 function loadState() {
   if (fs.existsSync(STATE_FILE)) {
@@ -66,7 +90,13 @@ function loadState() {
       console.error('Failed to parse state.json, starting fresh:', e);
     }
   }
-  const fresh = { turn: {}, seeded: [], lastAutoSent: {} };
+  const fresh = {
+    turn: {},
+    seeded: [],
+    lastAutoSent: {},
+    schedule: JSON.parse(JSON.stringify(DEFAULT_SCHEDULE)),
+    customChores: {},
+  };
   Object.keys(CHORES).forEach((choreId, i) => {
     // Stagger starting turns so nobody is dead last on everything by coincidence.
     fresh.turn[choreId] = i % Math.max(PEOPLE.length, 1);
@@ -79,8 +109,20 @@ function saveState(state) {
 }
 
 let state = loadState();
+// Backfill defaults for state.json files written before a given feature
+// existed, so upgrading never requires a manual migration step.
 if (!state.seeded) state.seeded = [];
 if (!state.lastAutoSent) state.lastAutoSent = {};
+if (!state.schedule) state.schedule = JSON.parse(JSON.stringify(DEFAULT_SCHEDULE));
+if (!state.customChores) state.customChores = {};
+
+// Merge built-in chores with any added from the dashboard. Custom chores use
+// the exact same { label, keywords } shape as built-in ones, so every other
+// function in this file (matching, messaging, scheduling) treats them
+// identically without needing to know which is which.
+function getChores() {
+  return Object.assign({}, CHORES, state.customChores);
+}
 
 function whoseTurn(choreId) {
   const idx = state.turn[choreId] ?? 0;
@@ -101,7 +143,7 @@ function advanceTurn(choreId) {
 
 function findChoreInText(text) {
   const lower = text.toLowerCase();
-  for (const [choreId, chore] of Object.entries(CHORES)) {
+  for (const [choreId, chore] of Object.entries(getChores())) {
     if (chore.keywords.some((kw) => lower.includes(kw))) {
       return choreId;
     }
@@ -137,7 +179,7 @@ function findPersonByNumber(number) {
 }
 
 function statusMessage() {
-  const lines = Object.entries(CHORES).map(([choreId, chore]) => {
+  const lines = Object.entries(getChores()).map(([choreId, chore]) => {
     const person = whoseTurn(choreId);
     return `- ${chore.label}: ${person ? person.name : 'unassigned'}`;
   });
@@ -307,11 +349,13 @@ app.post('/webhook', async (req, res) => {
       return;
     }
 
+    const choreLabel = getChores()[choreId].label;
+
     if (isDoneMessage(body)) {
       const next = advanceTurn(choreId);
-      await sendSMS(replyTo, `✅ Marked "${CHORES[choreId].label}" as done. Next up: ${next.name}.`);
+      await sendSMS(replyTo, `✅ Marked "${choreLabel}" as done. Next up: ${next.name}.`);
       if (normalizeNumber(next.number) !== normalizeNumber(fromNumber)) {
-        await sendSMS(next.number, `🏠 Heads up ${next.name} — it's your turn for: ${CHORES[choreId].label}.`);
+        await sendSMS(next.number, `🏠 Heads up ${next.name} — it's your turn for: ${choreLabel}.`);
       }
       return;
     }
@@ -323,10 +367,10 @@ app.post('/webhook', async (req, res) => {
       return;
     }
     if (normalizeNumber(person.number) !== normalizeNumber(fromNumber)) {
-      await sendSMS(person.number, `🏠 Reminder from ${senderName}: it's your turn to do — ${CHORES[choreId].label}.`);
-      await sendSMS(replyTo, `Got it — I reminded ${person.name} to handle "${CHORES[choreId].label}".`);
+      await sendSMS(person.number, `🏠 Reminder from ${senderName}: it's your turn to do — ${choreLabel}.`);
+      await sendSMS(replyTo, `Got it — I reminded ${person.name} to handle "${choreLabel}".`);
     } else {
-      await sendSMS(replyTo, `Looks like it's already your turn for "${CHORES[choreId].label}" — go get 'em!`);
+      await sendSMS(replyTo, `Looks like it's already your turn for "${choreLabel}" — go get 'em!`);
     }
   } catch (err) {
     console.error('Error handling message:', err);
@@ -335,36 +379,29 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 7. Scheduled reminders — hardcoded weekly times per chore
+// 7. Scheduled reminders — weekly times per chore, editable at runtime
 // ---------------------------------------------------------------------
-// Edit SCHEDULE below to set which day(s) and time(s) each chore should
-// automatically remind whoever's turn it is, no incoming text required.
-//   day:  'sun' | 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat'
-//   time: 24-hour "HH:MM", interpreted in TIMEZONE below
-// A chore can have more than one entry per week (e.g. trash twice a week).
-// These are placeholder defaults — edit them to match your household.
+// The live schedule lives in state.schedule (persisted to state.json), so it
+// can be edited from the dashboard without touching code or redeploying.
+// DEFAULT_SCHEDULE (section 1) only seeds it the very first time the bot runs.
 
 const TIMEZONE = process.env.TIMEZONE || 'America/Los_Angeles';
 
-const SCHEDULE = {
-  vacuuming: [{ day: 'sat', time: '10:00' }],
-  bathroom: [{ day: 'wed', time: '18:00' }],
-  balcony: [{ day: 'sun', time: '11:00' }],
-  trash: [
-    { day: 'mon', time: '08:00' },
-    { day: 'thu', time: '08:00' },
-  ],
-};
-
-// Precompute {hour, minute} once at startup instead of re-parsing the
-// "HH:MM" string on every check.
+// Precompute {hour, minute} from a stored "HH:MM" string.
 function parseHHMM(str) {
   const [hour, minute] = String(str).split(':').map((n) => parseInt(n, 10));
   return { hour, minute };
 }
-const SCHEDULE_PARSED = {};
-for (const [choreId, entries] of Object.entries(SCHEDULE)) {
-  SCHEDULE_PARSED[choreId] = entries.map((e) => ({ day: e.day, ...parseHHMM(e.time) }));
+
+// Recomputed on every use rather than cached at startup, since state.schedule
+// can change at runtime via the dashboard — this data is tiny, so recomputing
+// costs nothing.
+function getScheduleParsed() {
+  const parsed = {};
+  for (const [choreId, entries] of Object.entries(state.schedule)) {
+    parsed[choreId] = entries.map((e) => ({ day: e.day, ...parseHHMM(e.time) }));
+  }
+  return parsed;
 }
 
 // Get the current local weekday/hour/minute/date in TIMEZONE. Uses the
@@ -402,8 +439,9 @@ function getLocalParts(date, timeZone) {
 function findDueReminders(now) {
   const { weekday, hour, minute, dateStr } = getLocalParts(now, TIMEZONE);
   const duePerPerson = new Map(); // number -> { name, chores: [...], slotKeys: [{slotKey, dateStr}] }
+  const chores = getChores();
 
-  for (const [choreId, entries] of Object.entries(SCHEDULE_PARSED)) {
+  for (const [choreId, entries] of Object.entries(getScheduleParsed())) {
     for (const entry of entries) {
       if (entry.day !== weekday || entry.hour !== hour || entry.minute !== minute) continue;
 
@@ -415,12 +453,14 @@ function findDueReminders(now) {
 
       const person = whoseTurn(choreId);
       if (!person) continue;
+      const chore = chores[choreId];
+      if (!chore) continue; // schedule entry left over from a deleted chore
 
       if (!duePerPerson.has(person.number)) {
         duePerPerson.set(person.number, { name: person.name, chores: [], slotKeys: [] });
       }
       const forPerson = duePerPerson.get(person.number);
-      forPerson.chores.push(CHORES[choreId].label);
+      forPerson.chores.push(chore.label);
       forPerson.slotKeys.push({ slotKey, dateStr });
     }
   }
@@ -484,6 +524,32 @@ function computeNextOccurrence(entry, from, timeZone) {
   return null; // should be unreachable given a valid entry
 }
 
+// Build a "click to add" Google Calendar link for one schedule entry. This
+// needs no Google account/API credentials on our side — Google Calendar
+// supports creating a pre-filled event (including a weekly recurrence)
+// purely from URL parameters. The housemate still has to click "Save" on
+// Google's own page, so this can never create an event without their
+// explicit action.
+function buildGoogleCalendarUrl(choreLabel, entry, timeZone) {
+  const { hour, minute } = parseHHMM(entry.time);
+  const start = computeNextOccurrence({ day: entry.day, hour, minute }, new Date(), timeZone);
+  if (!start) return null;
+  const end = new Date(start.getTime() + 30 * 60 * 1000); // 30-minute placeholder duration
+
+  const toGCalUTC = (d) => d.toISOString().replace(/[-:]/g, '').split('.')[0] + 'Z';
+  const byday = { sun: 'SU', mon: 'MO', tue: 'TU', wed: 'WE', thu: 'TH', fri: 'FR', sat: 'SA' }[entry.day];
+
+  const params = new URLSearchParams({
+    action: 'TEMPLATE',
+    text: `Chore: ${choreLabel}`,
+    dates: `${toGCalUTC(start)}/${toGCalUTC(end)}`,
+    details: `Reminder from House Chore Bot — it's your turn for: ${choreLabel}.`,
+    recur: `RRULE:FREQ=WEEKLY;BYDAY=${byday}`,
+    ctz: timeZone,
+  });
+  return `https://calendar.google.com/calendar/render?${params.toString()}`;
+}
+
 // Check once a minute. runScheduledReminders() already catches its own
 // errors; this wrapper is an extra safety net on top of that.
 const SCHEDULER_INTERVAL_MS = 60 * 1000;
@@ -494,7 +560,7 @@ setInterval(() => {
 
 // Read-only debug endpoint: check what the scheduler would do at a given
 // moment, without sending anything or changing state. Useful for confirming
-// your SCHEDULE and TIMEZONE are set up the way you expect.
+// your schedule and TIMEZONE are set up the way you expect.
 // e.g. /debug/schedule?secret=...&at=2026-08-25T15:00:00Z
 app.get('/debug/schedule', (req, res) => {
   const secret = process.env.SEED_SECRET;
@@ -533,6 +599,138 @@ app.post('/debug/trigger-schedule', async (req, res) => {
     res.json({ ranAt: at.toISOString(), lastAutoSent: state.lastAutoSent });
   } catch (err) {
     console.error('Error in /debug/trigger-schedule:', err);
+    res.status(500).json({ error: 'Something went wrong — check server logs.' });
+  }
+});
+
+// ---------------------------------------------------------------------
+// 7b. Schedule & task management API — powers the dashboard's editor
+// ---------------------------------------------------------------------
+// The three mutating endpoints below are protected by the same SEED_SECRET
+// as /seed and the /debug endpoints above. The gcal-link endpoint is
+// read-only (just computes a URL) so it needs no secret.
+
+function requireSecret(req, res) {
+  const secret = process.env.SEED_SECRET;
+  if (secret && req.query.secret !== secret) {
+    res.status(403).json({ error: 'forbidden — wrong or missing admin key' });
+    return false;
+  }
+  return true;
+}
+
+// Add one schedule entry — either to an existing chore (choreId), or to a
+// brand-new one created on the fly (newChoreLabel + optional newChoreKeywords).
+app.post('/api/schedule/add', (req, res) => {
+  if (!requireSecret(req, res)) return;
+  try {
+    const { choreId, newChoreLabel, newChoreKeywords, day, time } = req.body || {};
+
+    if (!DAYS.includes(day)) {
+      return res.status(400).json({ error: 'invalid day — use sun/mon/tue/wed/thu/fri/sat' });
+    }
+    if (!TIME_RE.test(time || '')) {
+      return res.status(400).json({ error: 'invalid time — use 24-hour HH:MM' });
+    }
+
+    const chores = getChores();
+    let targetChoreId = choreId;
+
+    if (!targetChoreId) {
+      const label = (newChoreLabel || '').trim();
+      if (!label) {
+        return res.status(400).json({ error: 'a task name is required when not selecting an existing task' });
+      }
+      const slug = label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-+|-+$)/g, '');
+      if (!slug) {
+        return res.status(400).json({ error: 'could not derive an id from that task name — try letters or numbers' });
+      }
+      if (chores[slug]) {
+        return res.status(409).json({ error: `"${label}" already exists — pick it from the dropdown instead of creating it again` });
+      }
+      const keywords = (newChoreKeywords || label)
+        .split(',')
+        .map((k) => k.trim().toLowerCase())
+        .filter(Boolean);
+      state.customChores[slug] = { label, keywords: keywords.length ? keywords : [slug] };
+      if (state.turn[slug] === undefined) state.turn[slug] = 0;
+      targetChoreId = slug;
+    } else if (!chores[targetChoreId]) {
+      return res.status(400).json({ error: 'unknown choreId' });
+    }
+
+    if (!state.schedule[targetChoreId]) state.schedule[targetChoreId] = [];
+    const alreadyScheduled = state.schedule[targetChoreId].some((e) => e.day === day && e.time === time);
+    if (alreadyScheduled) {
+      return res.status(409).json({ error: 'that day/time is already scheduled for this task' });
+    }
+    state.schedule[targetChoreId].push({ day, time });
+    saveState(state);
+    res.json({ ok: true, choreId: targetChoreId, schedule: state.schedule[targetChoreId] });
+  } catch (err) {
+    console.error('Error in /api/schedule/add:', err);
+    res.status(500).json({ error: 'Something went wrong — check server logs.' });
+  }
+});
+
+// Remove one schedule entry (an exact day+time) from a task.
+app.post('/api/schedule/remove', (req, res) => {
+  if (!requireSecret(req, res)) return;
+  try {
+    const { choreId, day, time } = req.body || {};
+    if (!state.schedule[choreId]) {
+      return res.status(404).json({ error: 'unknown task or it has no schedule' });
+    }
+    const before = state.schedule[choreId].length;
+    state.schedule[choreId] = state.schedule[choreId].filter((e) => !(e.day === day && e.time === time));
+    if (state.schedule[choreId].length === before) {
+      return res.status(404).json({ error: 'that schedule entry was not found' });
+    }
+    saveState(state);
+    res.json({ ok: true, schedule: state.schedule[choreId] });
+  } catch (err) {
+    console.error('Error in /api/schedule/remove:', err);
+    res.status(500).json({ error: 'Something went wrong — check server logs.' });
+  }
+});
+
+// Delete a task created from the dashboard entirely (schedule + turn state).
+// Only dashboard-added tasks can be removed this way — the 4 built-in chores
+// can only be unscheduled (via /api/schedule/remove), never deleted, since
+// they're wired into the code.
+app.post('/api/chore/remove', (req, res) => {
+  if (!requireSecret(req, res)) return;
+  try {
+    const { choreId } = req.body || {};
+    if (!choreId || !state.customChores[choreId]) {
+      return res.status(400).json({ error: 'unknown or built-in task — only dashboard-added tasks can be deleted' });
+    }
+    delete state.customChores[choreId];
+    delete state.schedule[choreId];
+    delete state.turn[choreId];
+    saveState(state);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Error in /api/chore/remove:', err);
+    res.status(500).json({ error: 'Something went wrong — check server logs.' });
+  }
+});
+
+// Read-only: build an "Add to Google Calendar" link for one schedule entry.
+// No admin key needed — it doesn't touch state, just computes a URL.
+app.get('/api/gcal-link', (req, res) => {
+  try {
+    const { choreId, day, time } = req.query;
+    const chore = getChores()[choreId];
+    if (!chore) return res.status(404).json({ error: 'unknown task' });
+    if (!DAYS.includes(day)) return res.status(400).json({ error: 'invalid day' });
+    if (!TIME_RE.test(time || '')) return res.status(400).json({ error: 'invalid time' });
+
+    const url = buildGoogleCalendarUrl(chore.label, { day, time }, TIMEZONE);
+    if (!url) return res.status(500).json({ error: 'could not compute a date for that entry' });
+    res.json({ url });
+  } catch (err) {
+    console.error('Error in /api/gcal-link:', err);
     res.status(500).json({ error: 'Something went wrong — check server logs.' });
   }
 });
@@ -583,19 +781,21 @@ app.get('/seed', async (req, res) => {
 // endpoint, so the two views can't drift out of sync with each other.
 // Deliberately excludes phone numbers and secrets — this page has no auth
 // (it also serves as Render's health check target), so nothing sensitive
-// belongs on it. Actions that actually send messages stay behind the
-// existing SEED_SECRET-protected endpoints.
+// belongs on it. Actions that actually mutate state or send messages stay
+// behind the existing SEED_SECRET-protected endpoints.
 
 function buildStatusData() {
   const now = new Date();
   const local = getLocalParts(now, TIMEZONE);
 
   const schedulerActive = lastTickAt !== null && Date.now() - lastTickAt.getTime() < SCHEDULER_INTERVAL_MS * 1.5;
+  const chores = getChores();
+  const scheduleParsed = getScheduleParsed();
 
-  const chores = Object.entries(CHORES).map(([choreId, chore]) => {
+  const choreList = Object.entries(chores).map(([choreId, chore]) => {
     const person = whoseTurn(choreId);
-    const entries = SCHEDULE[choreId] || [];
-    const parsedEntries = SCHEDULE_PARSED[choreId] || [];
+    const entries = state.schedule[choreId] || [];
+    const parsedEntries = scheduleParsed[choreId] || [];
     const nextDates = parsedEntries
       .map((e) => computeNextOccurrence(e, now, TIMEZONE))
       .filter(Boolean)
@@ -605,8 +805,9 @@ function buildStatusData() {
     return {
       id: choreId,
       label: chore.label,
+      isCustom: !!state.customChores[choreId],
       currentTurn: person ? person.name : 'unassigned',
-      scheduleText: entries.map((e) => `${e.day} ${e.time}`).join(', ') || 'not scheduled',
+      scheduleEntries: entries.map((e) => ({ day: e.day, time: e.time, display: `${e.day} ${e.time}` })),
       nextReminder: next
         ? next.toLocaleString('en-US', { timeZone: TIMEZONE, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
         : null,
@@ -626,7 +827,7 @@ function buildStatusData() {
     seededCount: state.seeded.length,
     schedulerActive,
     schedulerLastTickISO: lastTickAt ? lastTickAt.toISOString() : null,
-    chores,
+    chores: choreList,
   };
 }
 
@@ -634,28 +835,77 @@ function escapeHTML(str) {
   return String(str).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+function escapeAttr(str) {
+  // Same as escapeHTML — split out for readability at call sites that are
+  // specifically filling an HTML attribute (onclick args, values, etc).
+  return escapeHTML(str);
+}
+
+const DAY_LABELS = { sun: 'Sun', mon: 'Mon', tue: 'Tue', wed: 'Wed', thu: 'Thu', fri: 'Fri', sat: 'Sat' };
+
 function renderDashboardHTML(data) {
   const statusDot = (ok) => (ok ? '🟢' : '🔴');
 
-  const configRows = [
+  const healthCards = [
     [statusDot(data.textbeltConfigured), 'Textbelt API key', data.textbeltConfigured ? 'configured' : 'MISSING — sends will fail'],
-    [statusDot(data.webhookBaseUrlConfigured), 'Webhook base URL', data.webhookBaseUrlConfigured ? escapeHTML(data.webhookBaseUrl) : 'MISSING — replies can\'t reach this server'],
+    [statusDot(data.webhookBaseUrlConfigured), 'Webhook base URL', data.webhookBaseUrlConfigured ? escapeHTML(data.webhookBaseUrl) : "MISSING — replies can't reach this server"],
     [statusDot(data.peopleConfiguredCount === 3), 'Housemates configured', `${data.peopleConfiguredCount} / 3 (${escapeHTML(data.peopleNames.join(', ') || 'none')})`],
-    [statusDot(data.seededCount > 0), 'Reply channels seeded', `${data.seededCount} / ${data.peopleConfiguredCount}${data.seededCount === 0 ? ' — run /seed' : ''}`],
-    [statusDot(data.schedulerActive), 'Automatic reminders', data.schedulerActive ? `active — last checked ${escapeHTML(data.schedulerLastTickISO)}` : 'not confirmed active yet (server just started, or something is wrong — wait a minute and refresh)'],
+    [statusDot(data.seededCount > 0), 'Reply channels seeded', `${data.seededCount} / ${data.peopleConfiguredCount}${data.seededCount === 0 ? ' — run Seed below' : ''}`],
+    [statusDot(data.schedulerActive), 'Automatic reminders', data.schedulerActive ? 'active — heartbeat confirmed' : 'not confirmed yet (just started, or something is wrong — wait a minute and refresh)'],
     [data.testMode ? '🧪' : '⚪', 'Test mode', data.testMode ? 'ON — all sends redirected to TEST_NUMBER' : 'off — sends go to real recipients'],
   ];
 
-  const choreRows = data.chores
+  const healthCardsHTML = healthCards
     .map(
-      (c) => `
-      <tr>
-        <td>${escapeHTML(c.label)}</td>
-        <td><strong>${escapeHTML(c.currentTurn)}</strong></td>
-        <td>${escapeHTML(c.scheduleText)}</td>
-        <td>${c.nextReminder ? escapeHTML(c.nextReminder) : '—'}</td>
-      </tr>`
+      ([dot, label, value]) => `
+      <div class="health-card">
+        <span class="dot">${dot}</span>
+        <div>
+          <div class="health-label">${escapeHTML(label)}</div>
+          <div class="health-value">${value}</div>
+        </div>
+      </div>`
     )
+    .join('');
+
+  const choreOptionsHTML = data.chores
+    .map((c) => `<option value="${escapeAttr(c.id)}">${escapeHTML(c.label)}</option>`)
+    .join('');
+
+  const dayOptionsHTML = DAYS.map((d) => `<option value="${d}">${DAY_LABELS[d]}</option>`).join('');
+
+  const choreCardsHTML = data.chores
+    .map((c) => {
+      const pills = c.scheduleEntries.length
+        ? c.scheduleEntries
+            .map(
+              (e) => `
+          <span class="pill">
+            <span>${DAY_LABELS[e.day] || escapeHTML(e.day)} ${escapeHTML(e.time)}</span>
+            <button type="button" class="pill-btn" title="Add to Google Calendar" onclick="addToCalendar('${escapeAttr(c.id)}','${escapeAttr(e.day)}','${escapeAttr(e.time)}')">📅</button>
+            <button type="button" class="pill-btn pill-btn-danger" title="Remove this reminder" onclick="removeSchedule('${escapeAttr(c.id)}','${escapeAttr(e.day)}','${escapeAttr(e.time)}')">✕</button>
+          </span>`
+            )
+            .join('')
+        : '<span class="pill pill-empty">not scheduled</span>';
+
+      const deleteTaskBtn = c.isCustom
+        ? `<button type="button" class="link-btn link-btn-danger" onclick="removeChore('${escapeAttr(c.id)}')">Delete this task</button>`
+        : '';
+
+      return `
+      <div class="chore-card">
+        <div class="chore-card-top">
+          <div class="chore-title">${escapeHTML(c.label)}${c.isCustom ? ' <span class="badge">added</span>' : ''}</div>
+          <div class="chore-turn">👤 ${escapeHTML(c.currentTurn)}</div>
+        </div>
+        <div class="pill-row">${pills}</div>
+        <div class="chore-card-bottom">
+          <span class="next-reminder">${c.nextReminder ? 'Next: ' + escapeHTML(c.nextReminder) : 'No upcoming reminder'}</span>
+          ${deleteTaskBtn}
+        </div>
+      </div>`;
+    })
     .join('');
 
   return `<!doctype html>
@@ -663,73 +913,230 @@ function renderDashboardHTML(data) {
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>House Chore Bot — Status</title>
+<title>House Chore Bot — Dashboard</title>
 <style>
-  :root { color-scheme: light dark; }
-  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
-  h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
-  .subtitle { color: #777; margin-top: 0; margin-bottom: 1.5rem; font-size: 0.9rem; }
-  table { width: 100%; border-collapse: collapse; margin-bottom: 1.5rem; }
-  th, td { text-align: left; padding: 0.5rem 0.6rem; border-bottom: 1px solid rgba(128,128,128,0.25); font-size: 0.92rem; }
-  th { font-weight: 600; color: #888; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }
-  section { margin-bottom: 2rem; }
-  h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: 0.03em; color: #888; margin-bottom: 0.5rem; }
-  .actions { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
-  input[type="password"] { padding: 0.5rem; border-radius: 6px; border: 1px solid rgba(128,128,128,0.4); font-size: 0.9rem; }
-  button { padding: 0.5rem 0.9rem; border-radius: 6px; border: 1px solid rgba(128,128,128,0.4); background: rgba(128,128,128,0.08); cursor: pointer; font-size: 0.9rem; }
-  button:hover { background: rgba(128,128,128,0.18); }
-  #actionResult { margin-top: 0.75rem; font-size: 0.85rem; white-space: pre-wrap; font-family: ui-monospace, monospace; background: rgba(128,128,128,0.08); padding: 0.6rem; border-radius: 6px; display: none; }
-  footer { color: #999; font-size: 0.8rem; margin-top: 2rem; }
+  :root { color-scheme: light dark; --accent: #6366f1; --danger: #ef4444; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem 3rem; line-height: 1.5; }
+  h1 { font-size: 1.5rem; margin: 0 0 0.15rem; }
+  .subtitle { color: #888; margin: 0 0 1.75rem; font-size: 0.9rem; }
+  section { margin-bottom: 2.25rem; }
+  h2 { font-size: 0.85rem; text-transform: uppercase; letter-spacing: 0.04em; color: #888; margin: 0 0 0.75rem; }
+  .card-shell { border: 1px solid rgba(128,128,128,0.25); border-radius: 14px; padding: 1.1rem 1.25rem; background: rgba(128,128,128,0.04); }
+
+  .health-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0.6rem; }
+  .health-card { display: flex; gap: 0.6rem; align-items: flex-start; border: 1px solid rgba(128,128,128,0.2); border-radius: 10px; padding: 0.7rem 0.85rem; background: rgba(128,128,128,0.04); }
+  .dot { font-size: 1rem; line-height: 1.3; }
+  .health-label { font-size: 0.78rem; color: #888; text-transform: uppercase; letter-spacing: 0.02em; }
+  .health-value { font-size: 0.92rem; word-break: break-word; }
+
+  .chore-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0.75rem; margin-bottom: 1.1rem; }
+  .chore-card { border: 1px solid rgba(128,128,128,0.25); border-radius: 12px; padding: 0.9rem 1rem; background: rgba(128,128,128,0.03); display: flex; flex-direction: column; gap: 0.6rem; }
+  .chore-card-top { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; }
+  .chore-title { font-weight: 600; font-size: 1rem; }
+  .badge { font-size: 0.68rem; font-weight: 500; text-transform: uppercase; letter-spacing: 0.03em; color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 0.05rem 0.4rem; vertical-align: middle; }
+  .chore-turn { font-size: 0.85rem; color: #aaa; white-space: nowrap; }
+  .pill-row { display: flex; flex-wrap: wrap; gap: 0.4rem; }
+  .pill { display: inline-flex; align-items: center; gap: 0.35rem; background: rgba(128,128,128,0.12); border-radius: 999px; padding: 0.25rem 0.3rem 0.25rem 0.65rem; font-size: 0.82rem; }
+  .pill-empty { color: #888; padding: 0.25rem 0.65rem; }
+  .pill-btn { border: none; background: transparent; cursor: pointer; font-size: 0.85rem; padding: 0.1rem 0.3rem; border-radius: 999px; line-height: 1; }
+  .pill-btn:hover { background: rgba(128,128,128,0.25); }
+  .pill-btn-danger:hover { background: rgba(239,68,68,0.25); }
+  .chore-card-bottom { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .next-reminder { font-size: 0.78rem; color: #888; }
+  .link-btn { border: none; background: transparent; color: var(--accent); font-size: 0.78rem; cursor: pointer; padding: 0; text-decoration: underline; }
+  .link-btn-danger { color: var(--danger); }
+
+  .admin-bar { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-bottom: 1.25rem; }
+  .admin-bar label { font-size: 0.85rem; color: #888; }
+  input[type="password"], input[type="text"], input[type="time"], select {
+    padding: 0.5rem 0.6rem; border-radius: 8px; border: 1px solid rgba(128,128,128,0.4);
+    font-size: 0.88rem; background: transparent; color: inherit;
+  }
+  .add-form { display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: flex-end; }
+  .field { display: flex; flex-direction: column; gap: 0.3rem; font-size: 0.78rem; color: #888; }
+  button.primary, button.secondary {
+    padding: 0.55rem 1rem; border-radius: 8px; border: 1px solid var(--accent); cursor: pointer; font-size: 0.88rem; font-weight: 500;
+  }
+  button.primary { background: var(--accent); color: #fff; }
+  button.primary:hover { opacity: 0.9; }
+  button.secondary { background: transparent; border-color: rgba(128,128,128,0.4); color: inherit; }
+  button.secondary:hover { background: rgba(128,128,128,0.15); }
+  .actions-row { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  #actionResult { margin-top: 0.9rem; font-size: 0.82rem; white-space: pre-wrap; font-family: ui-monospace, monospace; background: rgba(128,128,128,0.08); padding: 0.7rem 0.85rem; border-radius: 8px; display: none; max-height: 220px; overflow: auto; }
+  footer { color: #999; font-size: 0.78rem; margin-top: 2rem; }
 </style>
 </head>
 <body>
   <h1>🏠 House Chore Bot</h1>
   <p class="subtitle">Local time: ${escapeHTML(data.localTimeText)} (${escapeHTML(data.timezone)}) · Server time: ${escapeHTML(data.serverTimeISO)}</p>
 
+  <div class="admin-bar">
+    <label for="adminSecretInput">🔑 Admin key</label>
+    <input type="password" id="adminSecretInput" placeholder="required to add/remove/trigger">
+    <span style="font-size:0.78rem;color:#888;">only needed for actions below — never saved anywhere</span>
+  </div>
+
   <section>
     <h2>System health</h2>
-    <table>
-      ${configRows.map(([dot, label, value]) => `<tr><td style="width:1.6rem">${dot}</td><td>${escapeHTML(label)}</td><td>${value}</td></tr>`).join('')}
-    </table>
+    <div class="health-grid">${healthCardsHTML}</div>
   </section>
 
   <section>
-    <h2>Chore status</h2>
-    <table>
-      <tr><th>Chore</th><th>Whose turn</th><th>Schedule</th><th>Next auto-reminder</th></tr>
-      ${choreRows}
-    </table>
+    <h2>Tasks &amp; schedule</h2>
+    <div class="chore-grid">${choreCardsHTML}</div>
+
+    <div class="card-shell">
+      <div style="font-size:0.85rem; font-weight:600; margin-bottom:0.75rem;">Add a reminder</div>
+      <div class="add-form">
+        <div class="field">
+          <label for="choreSelect">Task</label>
+          <select id="choreSelect" onchange="toggleNewTaskFields()">
+            ${choreOptionsHTML}
+            <option value="__new__">＋ New task…</option>
+          </select>
+        </div>
+        <div class="field" id="newTaskNameField" style="display:none;">
+          <label for="newTaskName">New task name</label>
+          <input type="text" id="newTaskName" placeholder="e.g. Dishes">
+        </div>
+        <div class="field" id="newTaskKeywordsField" style="display:none;">
+          <label for="newTaskKeywords">Match words (comma-separated)</label>
+          <input type="text" id="newTaskKeywords" placeholder="e.g. dishes, dishwasher">
+        </div>
+        <div class="field">
+          <label for="daySelect">Day</label>
+          <select id="daySelect">${dayOptionsHTML}</select>
+        </div>
+        <div class="field">
+          <label for="timeInput">Time</label>
+          <input type="time" id="timeInput" value="09:00">
+        </div>
+        <button type="button" class="primary" onclick="addSchedule()">Add reminder</button>
+      </div>
+    </div>
   </section>
 
   <section>
     <h2>Quick actions</h2>
-    <p style="font-size:0.85rem; color:#888;">These send real messages (or nothing, in TEST_MODE). Enter your SEED_SECRET to use them.</p>
-    <div class="actions">
-      <input type="password" id="secretInput" placeholder="secret">
-      <button onclick="runAction('/seed', 'GET')">Run /seed</button>
-      <button onclick="runAction('/debug/trigger-schedule', 'POST')">Trigger scheduler now</button>
-      <button onclick="runAction('/debug/schedule', 'GET')">Preview schedule (read-only)</button>
+    <div class="actions-row">
+      <button type="button" class="secondary" onclick="runGetAction('/seed')">Run /seed</button>
+      <button type="button" class="secondary" onclick="runPostAction('/debug/trigger-schedule')">Trigger scheduler now</button>
+      <button type="button" class="secondary" onclick="runGetAction('/debug/schedule')">Preview schedule (read-only)</button>
     </div>
     <pre id="actionResult"></pre>
   </section>
 
-  <footer>This page has no login — don't share this URL publicly. It intentionally shows no phone numbers.</footer>
+  <footer>This page has no login — don't share this URL publicly. It intentionally shows no phone numbers or secrets.</footer>
 
   <script>
-    async function runAction(path, method) {
-      const secret = document.getElementById('secretInput').value;
-      const resultEl = document.getElementById('actionResult');
-      resultEl.style.display = 'block';
-      resultEl.textContent = 'Working...';
-      try {
-        const res = await fetch(path + '?secret=' + encodeURIComponent(secret), { method });
-        const text = await res.text();
-        let pretty = text;
-        try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch (e) {}
-        resultEl.textContent = res.status + ' ' + res.statusText + '\\n' + pretty;
-      } catch (err) {
-        resultEl.textContent = 'Request failed: ' + err.message;
+    function getSecret() {
+      return document.getElementById('adminSecretInput').value;
+    }
+
+    function showResult(status, text) {
+      var el = document.getElementById('actionResult');
+      el.style.display = 'block';
+      el.textContent = status + '\\n' + text;
+    }
+
+    function toggleNewTaskFields() {
+      var isNew = document.getElementById('choreSelect').value === '__new__';
+      document.getElementById('newTaskNameField').style.display = isNew ? 'flex' : 'none';
+      document.getElementById('newTaskKeywordsField').style.display = isNew ? 'flex' : 'none';
+    }
+
+    function runGetAction(path) {
+      var secret = getSecret();
+      showResult('Working...', '');
+      fetch(path + '?secret=' + encodeURIComponent(secret))
+        .then(function (res) {
+          return res.text().then(function (text) { return { res: res, text: text }; });
+        })
+        .then(function (r) {
+          var pretty = r.text;
+          try { pretty = JSON.stringify(JSON.parse(r.text), null, 2); } catch (e) {}
+          showResult(r.res.status + ' ' + r.res.statusText, pretty);
+        })
+        .catch(function (err) { showResult('Request failed', err.message); });
+    }
+
+    function runPostAction(path) {
+      var secret = getSecret();
+      showResult('Working...', '');
+      fetch(path + '?secret=' + encodeURIComponent(secret), { method: 'POST' })
+        .then(function (res) {
+          return res.text().then(function (text) { return { res: res, text: text }; });
+        })
+        .then(function (r) {
+          var pretty = r.text;
+          try { pretty = JSON.stringify(JSON.parse(r.text), null, 2); } catch (e) {}
+          showResult(r.res.status + ' ' + r.res.statusText, pretty);
+        })
+        .catch(function (err) { showResult('Request failed', err.message); });
+    }
+
+    function postJSON(path, body, onSuccess) {
+      var secret = getSecret();
+      showResult('Working...', '');
+      fetch(path + '?secret=' + encodeURIComponent(secret), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+        .then(function (res) {
+          return res.text().then(function (text) { return { res: res, text: text }; });
+        })
+        .then(function (r) {
+          var pretty = r.text;
+          try { pretty = JSON.stringify(JSON.parse(r.text), null, 2); } catch (e) {}
+          showResult(r.res.status + ' ' + r.res.statusText, pretty);
+          if (r.res.ok && onSuccess) onSuccess();
+        })
+        .catch(function (err) { showResult('Request failed', err.message); });
+    }
+
+    function addSchedule() {
+      var choreSelectVal = document.getElementById('choreSelect').value;
+      var day = document.getElementById('daySelect').value;
+      var time = document.getElementById('timeInput').value;
+      var body = { day: day, time: time };
+      if (choreSelectVal === '__new__') {
+        body.newChoreLabel = document.getElementById('newTaskName').value;
+        body.newChoreKeywords = document.getElementById('newTaskKeywords').value;
+      } else {
+        body.choreId = choreSelectVal;
       }
+      postJSON('/api/schedule/add', body, function () {
+        setTimeout(function () { location.reload(); }, 700);
+      });
+    }
+
+    function removeSchedule(choreId, day, time) {
+      if (!confirm('Remove this reminder?')) return;
+      postJSON('/api/schedule/remove', { choreId: choreId, day: day, time: time }, function () {
+        setTimeout(function () { location.reload(); }, 500);
+      });
+    }
+
+    function removeChore(choreId) {
+      if (!confirm('Delete this task entirely? This removes its whole schedule and turn history.')) return;
+      postJSON('/api/chore/remove', { choreId: choreId }, function () {
+        setTimeout(function () { location.reload(); }, 500);
+      });
+    }
+
+    function addToCalendar(choreId, day, time) {
+      fetch('/api/gcal-link?choreId=' + encodeURIComponent(choreId) + '&day=' + encodeURIComponent(day) + '&time=' + encodeURIComponent(time))
+        .then(function (res) { return res.json(); })
+        .then(function (data) {
+          if (data.url) {
+            window.open(data.url, '_blank');
+          } else {
+            showResult('Could not build calendar link', JSON.stringify(data));
+          }
+        })
+        .catch(function (err) { showResult('Request failed', err.message); });
     }
   </script>
 </body>
