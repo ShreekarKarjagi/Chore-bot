@@ -558,15 +558,25 @@ setInterval(() => {
   runScheduledReminders(lastTickAt).catch((err) => console.error('Unexpected scheduler error:', err));
 }, SCHEDULER_INTERVAL_MS);
 
+// Checks the ?secret= query param against SEED_SECRET. Skipped entirely
+// while TEST_MODE is on — a test deploy only ever touches TEST_NUMBER
+// anyway, so requiring the admin key there is just friction, not safety.
+function requireSecret(req, res) {
+  if (TEST_MODE) return true;
+  const secret = process.env.SEED_SECRET;
+  if (secret && req.query.secret !== secret) {
+    res.status(403).json({ error: 'forbidden — wrong or missing admin key' });
+    return false;
+  }
+  return true;
+}
+
 // Read-only debug endpoint: check what the scheduler would do at a given
 // moment, without sending anything or changing state. Useful for confirming
 // your schedule and TIMEZONE are set up the way you expect.
 // e.g. /debug/schedule?secret=...&at=2026-08-25T15:00:00Z
 app.get('/debug/schedule', (req, res) => {
-  const secret = process.env.SEED_SECRET;
-  if (secret && req.query.secret !== secret) {
-    return res.status(403).send('forbidden');
-  }
+  if (!requireSecret(req, res)) return;
   const at = req.query.at ? new Date(req.query.at) : new Date();
   if (Number.isNaN(at.getTime())) {
     return res.status(400).json({ error: 'invalid ?at= timestamp — use ISO format, e.g. 2026-08-25T15:00:00Z' });
@@ -586,10 +596,7 @@ app.get('/debug/schedule', (req, res) => {
 // clock to hit an exact scheduled minute, or for manually re-sending a
 // reminder you missed. Respects TEST_MODE like everything else.
 app.post('/debug/trigger-schedule', async (req, res) => {
-  const secret = process.env.SEED_SECRET;
-  if (secret && req.query.secret !== secret) {
-    return res.status(403).send('forbidden');
-  }
+  if (!requireSecret(req, res)) return;
   const at = req.query.at ? new Date(req.query.at) : new Date();
   if (Number.isNaN(at.getTime())) {
     return res.status(400).json({ error: 'invalid ?at= timestamp — use ISO format, e.g. 2026-08-25T15:00:00Z' });
@@ -606,18 +613,10 @@ app.post('/debug/trigger-schedule', async (req, res) => {
 // ---------------------------------------------------------------------
 // 7b. Schedule & task management API — powers the dashboard's editor
 // ---------------------------------------------------------------------
-// The three mutating endpoints below are protected by the same SEED_SECRET
-// as /seed and the /debug endpoints above. The gcal-link endpoint is
-// read-only (just computes a URL) so it needs no secret.
-
-function requireSecret(req, res) {
-  const secret = process.env.SEED_SECRET;
-  if (secret && req.query.secret !== secret) {
-    res.status(403).json({ error: 'forbidden — wrong or missing admin key' });
-    return false;
-  }
-  return true;
-}
+// The three mutating endpoints below are protected by requireSecret() (see
+// above) — same admin key as /seed and the /debug endpoints, same TEST_MODE
+// bypass. The gcal-link endpoint is read-only (just computes a URL) so it
+// needs no secret at all, in or out of TEST_MODE.
 
 // Add one schedule entry — either to an existing chore (choreId), or to a
 // brand-new one created on the fly (newChoreLabel + optional newChoreKeywords).
@@ -743,10 +742,7 @@ app.get('/api/gcal-link', (req, res) => {
 // browser, with your secret) to text all 3 people and arm their channels.
 
 app.get('/seed', async (req, res) => {
-  const secret = process.env.SEED_SECRET;
-  if (secret && req.query.secret !== secret) {
-    return res.status(403).send('forbidden');
-  }
+  if (!requireSecret(req, res)) return;
   try {
     // In TEST_MODE, only seed the one test person — sendSMS() would redirect
     // the other two anyway, but skipping them here avoids spending 3 credits
@@ -973,8 +969,8 @@ function renderDashboardHTML(data) {
 
   <div class="admin-bar">
     <label for="adminSecretInput">🔑 Admin key</label>
-    <input type="password" id="adminSecretInput" placeholder="required to add/remove/trigger">
-    <span style="font-size:0.78rem;color:#888;">only needed for actions below — never saved anywhere</span>
+    <input type="password" id="adminSecretInput" placeholder="${data.testMode ? 'not required in TEST_MODE' : 'required to add/remove/trigger'}" ${data.testMode ? 'disabled' : ''}>
+    <span style="font-size:0.78rem;color:#888;">${data.testMode ? '🧪 TEST_MODE is on — admin key is not required right now' : 'only needed for actions below — never saved anywhere'}</span>
   </div>
 
   <section>

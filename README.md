@@ -98,10 +98,15 @@ shows a real dashboard, not just a plain "it's running" message:
     Calendar itself supports, so the bot can never create a calendar event
     without that person's own click.
   - Adding/removing/deleting all require your `SEED_SECRET` in the "Admin
-    key" box at the top of the page (typed in, never saved anywhere).
+    key" box at the top of the page (typed in, never saved anywhere) —
+    **except while `TEST_MODE=true`**, where the admin key is skipped
+    entirely (the box shows disabled and says so) since a test deploy only
+    ever touches `TEST_NUMBER` anyway, so gating it adds friction without
+    adding safety. Turn `TEST_MODE` off before going live and the admin key
+    is required again everywhere.
 - **Quick actions** — buttons to run `/seed`, manually trigger the scheduler
   right now, or preview what the scheduler would do, without needing to build
-  URLs by hand. Same admin key as above.
+  URLs by hand. Same admin key (and same `TEST_MODE` bypass) as above.
 
 For scripts or monitoring, the same data is available as JSON at `/status.json`
 (no secret needed — it's read-only and has nothing sensitive in it).
