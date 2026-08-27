@@ -80,6 +80,17 @@ shows a real dashboard, not just a plain "it's running" message:
 - **Tasks & schedule** — a card per task showing whose turn it is, every
   scheduled day/time as a small pill, and the next time it'll auto-remind
   someone. This is also the schedule *editor*:
+  - **Change whose turn it is** — each task card has a dropdown of all 3
+    housemates. Picking someone sets that task's turn directly (this is a
+    manual override, separate from the normal "text `<chore> done`" flow —
+    it doesn't require anyone to have finished the chore, it just reassigns
+    it, e.g. to fix a mistake or hand a chore to someone covering for you).
+  - **Send reminder now** — click "📨 Send reminder now" on a task card to
+    immediately text whoever's currently assigned, on the spot — no need to
+    wait for the scheduled time. It goes out through the exact same texting
+    path as every other message the bot sends (respects `TEST_MODE`,
+    re-arms that person's reply channel, etc), it's just triggered by a
+    click instead of the clock.
   - **Add a reminder** — pick an existing task (or type a new one) plus a
     day and time, and hit "Add reminder." A brand-new task also gets its own
     keywords (comma-separated words that trigger it over text, e.g.
@@ -97,13 +108,13 @@ shows a real dashboard, not just a plain "it's running" message:
     Google account or API key on the bot's side; it's a plain link Google
     Calendar itself supports, so the bot can never create a calendar event
     without that person's own click.
-  - Adding/removing/deleting all require your `SEED_SECRET` in the "Admin
-    key" box at the top of the page (typed in, never saved anywhere) —
-    **except while `TEST_MODE=true`**, where the admin key is skipped
-    entirely (the box shows disabled and says so) since a test deploy only
-    ever touches `TEST_NUMBER` anyway, so gating it adds friction without
-    adding safety. Turn `TEST_MODE` off before going live and the admin key
-    is required again everywhere.
+  - Everything above except the calendar link requires your `SEED_SECRET` in
+    the "Admin key" box at the top of the page (typed in, never saved
+    anywhere) — **except while `TEST_MODE=true`**, where the admin key is
+    skipped entirely (the box shows disabled and says so) since a test
+    deploy only ever touches `TEST_NUMBER` anyway, so gating it adds
+    friction without adding safety. Turn `TEST_MODE` off before going live
+    and the admin key is required again everywhere.
 - **Quick actions** — buttons to run `/seed`, manually trigger the scheduler
   right now, or preview what the scheduler would do, without needing to build
   URLs by hand. Same admin key (and same `TEST_MODE` bypass) as above.

@@ -715,6 +715,51 @@ app.post('/api/chore/remove', (req, res) => {
   }
 });
 
+// Manually set whose turn it is for a task (the dashboard's per-task
+// dropdown) — an on-demand override alongside the normal advance-on-"done"
+// flow, not a replacement for it. personIndex is an index into PEOPLE.
+app.post('/api/chore/set-turn', (req, res) => {
+  if (!requireSecret(req, res)) return;
+  try {
+    const { choreId, personIndex } = req.body || {};
+    if (!getChores()[choreId]) {
+      return res.status(400).json({ error: 'unknown task' });
+    }
+    const idx = Number(personIndex);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= PEOPLE.length) {
+      return res.status(400).json({ error: 'invalid personIndex' });
+    }
+    state.turn[choreId] = idx;
+    saveState(state);
+    res.json({ ok: true, choreId, currentTurn: PEOPLE[idx].name });
+  } catch (err) {
+    console.error('Error in /api/chore/set-turn:', err);
+    res.status(500).json({ error: 'Something went wrong — check server logs.' });
+  }
+});
+
+// Manually send a reminder for one task, right now, to whoever's currently
+// assigned — independent of the schedule (doesn't wait for a scheduled
+// slot, doesn't mark anything in state.lastAutoSent). Goes through the
+// exact same sendSMS() path as every other message the bot sends, so it
+// respects TEST_MODE and re-arms the recipient's reply channel like normal.
+app.post('/api/chore/send-reminder', async (req, res) => {
+  if (!requireSecret(req, res)) return;
+  try {
+    const { choreId } = req.body || {};
+    const chore = getChores()[choreId];
+    if (!chore) return res.status(400).json({ error: 'unknown task' });
+    const person = whoseTurn(choreId);
+    if (!person) return res.status(400).json({ error: 'no one is configured for that task yet' });
+
+    const result = await sendSMS(person.number, `🏠 Reminder ${person.name} — it's your turn for: ${chore.label}.`);
+    res.json({ ok: true, sentTo: person.name, success: !!(result && result.success) });
+  } catch (err) {
+    console.error('Error in /api/chore/send-reminder:', err);
+    res.status(500).json({ error: 'Something went wrong — check server logs.' });
+  }
+});
+
 // Read-only: build an "Add to Google Calendar" link for one schedule entry.
 // No admin key needed — it doesn't touch state, just computes a URL.
 app.get('/api/gcal-link', (req, res) => {
@@ -803,6 +848,7 @@ function buildStatusData() {
       label: chore.label,
       isCustom: !!state.customChores[choreId],
       currentTurn: person ? person.name : 'unassigned',
+      turnIndex: state.turn[choreId] ?? 0,
       scheduleEntries: entries.map((e) => ({ day: e.day, time: e.time, display: `${e.day} ${e.time}` })),
       nextReminder: next
         ? next.toLocaleString('en-US', { timeZone: TIMEZONE, weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
@@ -870,6 +916,11 @@ function renderDashboardHTML(data) {
 
   const dayOptionsHTML = DAYS.map((d) => `<option value="${d}">${DAY_LABELS[d]}</option>`).join('');
 
+  const personOptionsHTML = (selectedIdx) =>
+    data.peopleNames
+      .map((name, i) => `<option value="${i}"${i === selectedIdx ? ' selected' : ''}>${escapeHTML(name)}</option>`)
+      .join('');
+
   const choreCardsHTML = data.chores
     .map((c) => {
       const pills = c.scheduleEntries.length
@@ -893,12 +944,17 @@ function renderDashboardHTML(data) {
       <div class="chore-card">
         <div class="chore-card-top">
           <div class="chore-title">${escapeHTML(c.label)}${c.isCustom ? ' <span class="badge">added</span>' : ''}</div>
-          <div class="chore-turn">👤 ${escapeHTML(c.currentTurn)}</div>
+          <div class="chore-turn">
+            👤 <select class="turn-select" onchange="setTurn('${escapeAttr(c.id)}', this.value)">${personOptionsHTML(c.turnIndex)}</select>
+          </div>
         </div>
         <div class="pill-row">${pills}</div>
         <div class="chore-card-bottom">
           <span class="next-reminder">${c.nextReminder ? 'Next: ' + escapeHTML(c.nextReminder) : 'No upcoming reminder'}</span>
-          ${deleteTaskBtn}
+          <div class="card-actions">
+            <button type="button" class="link-btn" onclick="sendReminder('${escapeAttr(c.id)}', this)">📨 Send reminder now</button>
+            ${deleteTaskBtn}
+          </div>
         </div>
       </div>`;
     })
@@ -931,7 +987,8 @@ function renderDashboardHTML(data) {
   .chore-card-top { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; }
   .chore-title { font-weight: 600; font-size: 1rem; }
   .badge { font-size: 0.68rem; font-weight: 500; text-transform: uppercase; letter-spacing: 0.03em; color: var(--accent); border: 1px solid var(--accent); border-radius: 999px; padding: 0.05rem 0.4rem; vertical-align: middle; }
-  .chore-turn { font-size: 0.85rem; color: #aaa; white-space: nowrap; }
+  .chore-turn { font-size: 0.85rem; color: #aaa; white-space: nowrap; display: flex; align-items: center; gap: 0.3rem; }
+  .turn-select { font-size: 0.82rem; padding: 0.2rem 0.4rem; border-radius: 6px; }
   .pill-row { display: flex; flex-wrap: wrap; gap: 0.4rem; }
   .pill { display: inline-flex; align-items: center; gap: 0.35rem; background: rgba(128,128,128,0.12); border-radius: 999px; padding: 0.25rem 0.3rem 0.25rem 0.65rem; font-size: 0.82rem; }
   .pill-empty { color: #888; padding: 0.25rem 0.65rem; }
@@ -939,6 +996,7 @@ function renderDashboardHTML(data) {
   .pill-btn:hover { background: rgba(128,128,128,0.25); }
   .pill-btn-danger:hover { background: rgba(239,68,68,0.25); }
   .chore-card-bottom { display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .card-actions { display: flex; align-items: center; gap: 0.7rem; flex-wrap: wrap; }
   .next-reminder { font-size: 0.78rem; color: #888; }
   .link-btn { border: none; background: transparent; color: var(--accent); font-size: 0.78rem; cursor: pointer; padding: 0; text-decoration: underline; }
   .link-btn-danger { color: var(--danger); }
@@ -1120,6 +1178,23 @@ function renderDashboardHTML(data) {
       postJSON('/api/chore/remove', { choreId: choreId }, function () {
         setTimeout(function () { location.reload(); }, 500);
       });
+    }
+
+    function setTurn(choreId, personIndex) {
+      postJSON('/api/chore/set-turn', { choreId: choreId, personIndex: personIndex }, function () {
+        setTimeout(function () { location.reload(); }, 400);
+      });
+    }
+
+    function sendReminder(choreId, btn) {
+      var original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = 'Sending…';
+      postJSON('/api/chore/send-reminder', { choreId: choreId });
+      setTimeout(function () {
+        btn.disabled = false;
+        btn.textContent = original;
+      }, 1500);
     }
 
     function addToCalendar(choreId, day, time) {
