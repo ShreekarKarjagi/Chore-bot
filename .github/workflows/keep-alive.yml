@@ -1,0 +1,41 @@
+name: Keep-alive ping
+
+# Render's free tier spins the service down after 15 minutes with no
+# inbound traffic. This workflow just visits the site's root page (which
+# doubles as Render's own health check, per the README) every 14 minutes so
+# it never sits idle long enough to sleep.
+#
+# One-time setup: Settings -> Secrets and variables -> Actions -> Variables ->
+# "New repository variable" -> name it APP_URL, value your deployed URL
+# (e.g. https://house-chore-bot.onrender.com, no trailing slash).
+#
+# Notes:
+# - GitHub only guarantees scheduled workflows run "close to" the requested
+#   time -- under load they can slip by a few minutes, so 14 minutes leaves
+#   a thin safety margin under Render's 15-minute cutoff. If you notice the
+#   site still spinning down occasionally, tighten the schedule below to
+#   every 10 minutes ("*/10 * * * *").
+# - GitHub disables scheduled workflows automatically if the repo goes 60
+#   days with no commits -- pushing anything (including this file) resets
+#   that clock.
+# - This keeps the site itself awake, but Render's free tier has no
+#   persistent disk, so state.json can still reset on a redeploy/restart --
+#   that's a separate, unrelated limitation.
+
+on:
+  schedule:
+    - cron: '*/14 * * * *'
+  workflow_dispatch: {} # lets you click "Run workflow" in the Actions tab to test it manually
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Ping the site
+        run: |
+          if [ -z "${{ vars.APP_URL }}" ]; then
+            echo "APP_URL repository variable is not set -- see the comment at the top of this file." >&2
+            exit 1
+          fi
+          curl -sS -o /dev/null -w 'HTTP %{http_code} in %{time_total}s\n' --max-time 30 "${{ vars.APP_URL }}/"
