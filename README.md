@@ -1,4 +1,4 @@
-# House Chore Bot
+# House Chore Bot: https://chore-bot-fvo5.onrender.com/
 
 A text-message bot for a 3-person household(personal use), built so nobody has to remember whose turn it is to take out the trash. Text it a chore name and it tells you who's on the hook; it also texts people on its own on a weekly schedule, so reminders happen without anyone having to ask.
 
