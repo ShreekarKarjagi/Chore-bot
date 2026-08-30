@@ -1,6 +1,6 @@
 # House Chore Bot
 
-A text-message bot for a 3-person household, built so nobody has to remember whose turn it is to take out the trash. Text it a chore name and it tells you who's on the hook; it also texts people on its own on a weekly schedule, so reminders happen without anyone having to ask.
+A text-message bot for a 3-person household(personal use), built so nobody has to remember whose turn it is to take out the trash. Text it a chore name and it tells you who's on the hook; it also texts people on its own on a weekly schedule, so reminders happen without anyone having to ask.
 
 I built this using **Textbelt**, Chores tracked out of the box: **vacuuming**, **cleaning the bathroom**, **cleaning the balcony**, **taking out the trash** — plus anything else you add from the dashboard.
 
