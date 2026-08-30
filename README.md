@@ -71,12 +71,6 @@ A few behaviors worth knowing:
 Visiting your deployed URL in a browser (e.g. `https://house-chore-bot.onrender.com/`)
 shows a real dashboard, not just a plain "it's running" message:
 
-- **System health** — at a glance, whether the Textbelt API key is configured,
-  whether `WEBHOOK_BASE_URL` is set, how many of the 3 housemates are
-  configured, how many have been seeded (see below), whether the automatic
-  scheduler has confirmed a heartbeat recently, and whether `TEST_MODE` is on.
-  Each card has a 🟢/🔴 (or 🧪/⚪ for test mode) so a problem is visible without
-  reading logs.
 - **Tasks & schedule** — a card per task showing whose turn it is, every
   scheduled day/time as a small pill, and the next time it'll auto-remind
   someone. This is also the schedule *editor*:
@@ -115,9 +109,15 @@ shows a real dashboard, not just a plain "it's running" message:
     deploy only ever touches `TEST_NUMBER` anyway, so gating it adds
     friction without adding safety. Turn `TEST_MODE` off before going live
     and the admin key is required again everywhere.
-- **Quick actions** — buttons to run `/seed`, manually trigger the scheduler
-  right now, or preview what the scheduler would do, without needing to build
-  URLs by hand. Same admin key (and same `TEST_MODE` bypass) as above.
+- **System health** — shown only while `TEST_MODE=true` (it's setup/debug
+  info, not something housemates need day-to-day). At a glance: whether the
+  Textbelt API key is configured, whether `WEBHOOK_BASE_URL` is set, how many
+  of the 3 housemates are configured, whether the automatic scheduler has
+  confirmed a heartbeat recently, and that test mode is on. Each card has a
+  🟢/🔴 (or 🧪 for test mode) so a problem is visible without reading logs.
+- **Quick actions** — buttons to manually trigger the scheduler right now, or
+  preview what the scheduler would do, without needing to build URLs by hand.
+  Same admin key (and same `TEST_MODE` bypass) as above.
 
 For scripts or monitoring, the same data is available as JSON at `/status.json`
 (no secret needed — it's read-only and has nothing sensitive in it).
@@ -148,17 +148,25 @@ POST https://your-app.onrender.com/debug/trigger-schedule?secret=YOUR_SEED_SECRE
 **does** send real texts (respecting `TEST_MODE` like everything else), so
 use it deliberately.
 
-### Important quirk: the one-time "seed" step
+### A quirk worth knowing: how reply channels get "armed"
 
 Textbelt only routes someone's texts to your bot **after** you've sent them at
 least one message with a reply-webhook attached — it doesn't have a
 traditional "any message that arrives on this number, forward it to me"
-webhook the way Twilio does. Every message the bot sends re-arms this for the
-next reply, so once the loop is going it stays going — but there needs to be
-one initial nudge to kick it off for each person. That's what the `/seed`
-endpoint below is for. **Do this once after deploying, and again for anyone
-who hasn't texted the bot in a very long time** if they ever stop getting
-replies.
+webhook the way Twilio does. There's no separate priming step for this,
+though: `sendSMS()` (the one function every outbound text goes through)
+attaches that reply-webhook to **every** message it sends, not just a
+dedicated setup message. So whichever message actually goes out to someone
+first — a scheduled reminder, a "Send reminder now" click from the
+dashboard, or a reply to something they texted the bot — arms their channel
+just as well as a standalone setup text would, automatically, no extra step.
+
+The one gap this leaves: if a housemate texts the bot completely cold,
+*before* it has ever sent them anything, there's nothing for that first
+reply to attach to and it won't route back. Right after deploying (or adding
+a new housemate), send everyone one reminder from the dashboard's "Send
+reminder now" button so each person's channel is armed before they try
+texting in.
 
 ---
 
@@ -216,25 +224,19 @@ Render deploys from a Git repository.
 
 5. Click **Create Web Service** and wait for it to go live.
 
-### Step 5 — Run the one-time seed
+### Step 5 — Test it
 
-Once deployed with the real `WEBHOOK_BASE_URL` set, open this in a browser
-(replace with your actual URL and secret):
+Open your app's root URL in a browser (e.g. `https://house-chore-bot.onrender.com/`)
+— that's the dashboard. On any task card, click "📨 Send reminder now" (you'll
+need the `SEED_SECRET` you set above, unless `TEST_MODE=true`). That sends a
+real first text to whoever's currently assigned, which also arms their reply
+channel (see the quirk explained below) — do this once per housemate after
+deploying.
 
-```
-https://house-chore-bot.onrender.com/seed?secret=mysecret123
-```
-
-This texts all 3 housemates an intro message and arms their reply channels.
-You should see a JSON response confirming each send succeeded.
-
-### Step 6 — Test it
-
-From any of the 3 housemates' phones, reply to that intro text with something
+Then, from any of the 3 housemates' phones, reply to that text with something
 like `trash` or `status`. You should get a reply within a few seconds.
 
-While you're testing, keep the dashboard open at your app's root URL (e.g.
-`https://house-chore-bot.onrender.com/`) — it's the fastest way to see
+Keep the dashboard open while you're testing — it's the fastest way to see
 whether everything's configured correctly and whose turn it currently is,
 without digging through Render's logs.
 
@@ -272,9 +274,9 @@ without digging through Render's logs.
   their public docs don't fully specify how long a channel stays "armed" after
   the last message. The bot re-arms it on every single message it sends (both
   replies and reminders), which should keep it alive indefinitely through
-  normal use. If someone ever stops getting replies after a long silence, hit
-  `/seed` again to re-open their channel (the dashboard's "Run /seed" button
-  does this without needing to build the URL by hand).
+  normal use. If someone ever stops getting replies after a long silence,
+  click "Send reminder now" on any task card for them from the dashboard to
+  re-open their channel.
 - **Cost:** pay-per-text, no monthly fee — check https://textbelt.com/purchase/
   for current rates. For a household's worth of chore texts, this should be a
   small amount per month.
@@ -298,5 +300,5 @@ Then simulate an incoming reply without needing a real webhook call from
 Textbelt — note this only works if you disable signature verification
 temporarily, since Textbelt signs real webhook calls with your API key. The
 simplest way to test end-to-end is to actually deploy with `textbelt_test`
-and use the `/seed` endpoint, which exercises the real send path without
-spending money or delivering a real text.
+and use the dashboard's "Send reminder now" button, which exercises the real
+send path without spending money or delivering a real text.

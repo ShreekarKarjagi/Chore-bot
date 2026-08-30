@@ -92,7 +92,6 @@ function loadState() {
   }
   const fresh = {
     turn: {},
-    seeded: [],
     lastAutoSent: {},
     schedule: JSON.parse(JSON.stringify(DEFAULT_SCHEDULE)),
     customChores: {},
@@ -110,8 +109,9 @@ function saveState(state) {
 
 let state = loadState();
 // Backfill defaults for state.json files written before a given feature
-// existed, so upgrading never requires a manual migration step.
-if (!state.seeded) state.seeded = [];
+// existed, so upgrading never requires a manual migration step. (A leftover
+// `seeded` key from older state.json files, back when there was a separate
+// /seed step, is harmless and just ignored — see section 8's comment.)
 if (!state.lastAutoSent) state.lastAutoSent = {};
 if (!state.schedule) state.schedule = JSON.parse(JSON.stringify(DEFAULT_SCHEDULE));
 if (!state.customChores) state.customChores = {};
@@ -614,9 +614,9 @@ app.post('/debug/trigger-schedule', async (req, res) => {
 // 7b. Schedule & task management API — powers the dashboard's editor
 // ---------------------------------------------------------------------
 // The three mutating endpoints below are protected by requireSecret() (see
-// above) — same admin key as /seed and the /debug endpoints, same TEST_MODE
-// bypass. The gcal-link endpoint is read-only (just computes a URL) so it
-// needs no secret at all, in or out of TEST_MODE.
+// above) — same admin key as the /debug endpoints, same TEST_MODE bypass.
+// The gcal-link endpoint is read-only (just computes a URL) so it needs no
+// secret at all, in or out of TEST_MODE.
 
 // Add one schedule entry — either to an existing chore (choreId), or to a
 // brand-new one created on the fly (newChoreLabel + optional newChoreKeywords).
@@ -780,40 +780,21 @@ app.get('/api/gcal-link', (req, res) => {
 });
 
 // ---------------------------------------------------------------------
-// 8. One-time seed endpoint
+// 8. (formerly a one-time /seed endpoint — no longer needed)
 // ---------------------------------------------------------------------
-// Textbelt only routes future texts to your webhook once a reply channel has
-// been opened with that number. Hit this once after deploying (from a
-// browser, with your secret) to text all 3 people and arm their channels.
-
-app.get('/seed', async (req, res) => {
-  if (!requireSecret(req, res)) return;
-  try {
-    // In TEST_MODE, only seed the one test person — sendSMS() would redirect
-    // the other two anyway, but skipping them here avoids spending 3 credits
-    // to deliver 1 actual text.
-    const peopleToSeed = TEST_MODE
-      ? PEOPLE.filter((p) => normalizeNumber(p.number) === normalizeNumber(TEST_NUMBER))
-      : PEOPLE;
-
-    const results = [];
-    for (const person of peopleToSeed) {
-      const r = await sendSMS(
-        person.number,
-        `👋 Hi ${person.name}, this is your house chore bot! Text me a chore name ("trash", "vacuuming", "bathroom", "balcony") anytime, or "status" to see whose turn it is.`
-      );
-      results.push({ person: person.name, success: r && r.success });
-      if (!state.seeded.includes(person.number)) {
-        state.seeded.push(person.number);
-      }
-    }
-    saveState(state);
-    res.json({ seeded: results, testMode: TEST_MODE });
-  } catch (err) {
-    console.error('Error in /seed:', err);
-    res.status(500).json({ error: 'Something went wrong seeding — check server logs.' });
-  }
-});
+// Textbelt only routes someone's texts to the bot's webhook once a reply
+// channel has been opened with that number — but sendSMS() (section 4)
+// already sets replyWebhookUrl on every single message it sends, not just a
+// dedicated "seed" message. That means whichever message actually goes out
+// first — a scheduled reminder, a "Send reminder now" click from the
+// dashboard, or a reply to something someone texted the bot — arms that
+// person's channel just as well as a standalone seed message would. So
+// there's no separate priming step to run: priming happens automatically,
+// as a side effect of the first real reminder. The one gap this leaves is a
+// housemate texting the bot completely cold, before it has ever sent them
+// anything — with nothing to attach the reply to, that first message won't
+// route back. Sending everyone one reminder (manually, via "Send reminder
+// now") right after deploying closes that gap in one click.
 
 // ---------------------------------------------------------------------
 // 9. Status dashboard
@@ -866,7 +847,6 @@ function buildStatusData() {
     webhookBaseUrl: WEBHOOK_BASE_URL || null,
     peopleConfiguredCount: PEOPLE.length,
     peopleNames: PEOPLE.map((p) => p.name),
-    seededCount: state.seeded.length,
     schedulerActive,
     schedulerLastTickISO: lastTickAt ? lastTickAt.toISOString() : null,
     chores: choreList,
@@ -888,11 +868,13 @@ const DAY_LABELS = { sun: 'Sun', mon: 'Mon', tue: 'Tue', wed: 'Wed', thu: 'Thu',
 function renderDashboardHTML(data) {
   const statusDot = (ok) => (ok ? '🟢' : '🔴');
 
+  // The health section only renders at all while TEST_MODE is on — it's
+  // debug/setup info, not something day-to-day housemates need to see, and
+  // TEST_MODE is precisely the phase where you'd want it in front of you.
   const healthCards = [
     [statusDot(data.textbeltConfigured), 'Textbelt API key', data.textbeltConfigured ? 'configured' : 'MISSING — sends will fail'],
     [statusDot(data.webhookBaseUrlConfigured), 'Webhook base URL', data.webhookBaseUrlConfigured ? escapeHTML(data.webhookBaseUrl) : "MISSING — replies can't reach this server"],
     [statusDot(data.peopleConfiguredCount === 3), 'Housemates configured', `${data.peopleConfiguredCount} / 3 (${escapeHTML(data.peopleNames.join(', ') || 'none')})`],
-    [statusDot(data.seededCount > 0), 'Reply channels seeded', `${data.seededCount} / ${data.peopleConfiguredCount}${data.seededCount === 0 ? ' — run Seed below' : ''}`],
     [statusDot(data.schedulerActive), 'Automatic reminders', data.schedulerActive ? 'active — heartbeat confirmed' : 'not confirmed yet (just started, or something is wrong — wait a minute and refresh)'],
     [data.testMode ? '🧪' : '⚪', 'Test mode', data.testMode ? 'ON — all sends redirected to TEST_NUMBER' : 'off — sends go to real recipients'],
   ];
@@ -909,6 +891,14 @@ function renderDashboardHTML(data) {
       </div>`
     )
     .join('');
+
+  const healthSectionHTML = data.testMode
+    ? `
+  <section>
+    <h2>System health</h2>
+    <div class="health-grid">${healthCardsHTML}</div>
+  </section>`
+    : '';
 
   const choreOptionsHTML = data.chores
     .map((c) => `<option value="${escapeAttr(c.id)}">${escapeHTML(c.label)}</option>`)
@@ -1032,16 +1022,11 @@ function renderDashboardHTML(data) {
   </div>
 
   <section>
-    <h2>System health</h2>
-    <div class="health-grid">${healthCardsHTML}</div>
-  </section>
-
-  <section>
     <h2>Tasks &amp; schedule</h2>
     <div class="chore-grid">${choreCardsHTML}</div>
 
     <div class="card-shell">
-      <div style="font-size:0.85rem; font-weight:600; margin-bottom:0.75rem;">Add a reminder</div>
+      <div style="font-size:0.85rem; font-weight:600; margin-bottom:0.75rem;">Add or Edit tasksr</div>
       <div class="add-form">
         <div class="field">
           <label for="choreSelect">Task</label>
@@ -1066,15 +1051,15 @@ function renderDashboardHTML(data) {
           <label for="timeInput">Time</label>
           <input type="time" id="timeInput" value="09:00">
         </div>
-        <button type="button" class="primary" onclick="addSchedule()">Add reminder</button>
+        <button type="button" class="primary" onclick="addSchedule()">Add </button>
       </div>
     </div>
   </section>
+${healthSectionHTML}
 
   <section>
     <h2>Quick actions</h2>
     <div class="actions-row">
-      <button type="button" class="secondary" onclick="runGetAction('/seed')">Run /seed</button>
       <button type="button" class="secondary" onclick="runPostAction('/debug/trigger-schedule')">Trigger scheduler now</button>
       <button type="button" class="secondary" onclick="runGetAction('/debug/schedule')">Preview schedule (read-only)</button>
     </div>
